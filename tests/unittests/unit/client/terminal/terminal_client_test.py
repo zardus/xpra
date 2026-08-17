@@ -96,6 +96,7 @@ class FakeWindowSubsystem:
         self.focus_events: list[tuple] = []
         self.buttons: list[tuple] = []
         self.wheels: list[tuple] = []
+        self.refreshes: list[int] = []
         self._window_with_grab = 0
 
     def cleanup(self) -> None:
@@ -106,6 +107,9 @@ class FakeWindowSubsystem:
 
     def update_focus(self, wid: int, gotit: bool) -> None:
         self.focus_events.append((wid, gotit))
+
+    def send_refresh(self, wid: int) -> None:
+        self.refreshes.append(wid)
 
     def send_button(self, device_id, wid, button, pressed, pointer, modifiers, buttons, props) -> None:
         self.buttons.append((device_id, wid, button, pressed, pointer, tuple(modifiers), tuple(buttons)))
@@ -588,6 +592,26 @@ class TerminalClientTest(unittest.TestCase):
             client.terminal_fd = -1
             os.close(rfd)
             os.close(wfd)
+
+    def test_typing_burst_requests_a_refresh(self):
+        # one refresh request per typing burst, to repair server-side damage holes:
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        client.kitty_keyboard = True
+        client.process_input_events([KeyEvent(ord("a"), event_type=1, text="a")])
+        self.assertNotEqual(client.type_refresh_timer, 0)
+        first_timer = client.type_refresh_timer
+        # more typing re-arms the timer instead of stacking requests:
+        client.process_input_events([KeyEvent(ord("b"), event_type=1, text="b")])
+        self.assertNotEqual(client.type_refresh_timer, first_timer)
+        # a key release on its own does not arm it:
+        client.source_remove(client.type_refresh_timer)
+        client.type_refresh_timer = 0
+        client.process_input_events([KeyEvent(ord("b"), event_type=3)])
+        self.assertEqual(client.type_refresh_timer, 0)
+        # when the timer fires, the focused window is refreshed:
+        client.type_refresh()
+        self.assertEqual(window_sub.refreshes, [1])
 
     def test_key_events_go_to_the_focused_window(self):
         client, window_sub = self.make_input_client()

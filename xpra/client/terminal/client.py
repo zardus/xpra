@@ -61,6 +61,10 @@ INPUT_FLUSH_DELAY: Final[int] = envint("XPRA_TERMINAL_INPUT_FLUSH_DELAY", 50)
 # how long to wait before adopting a suspicious terminal size reading
 # (one without pixel dimensions after a reading which had them), in milliseconds:
 SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
+# ask the server to refresh the focused window this long after the last key press,
+# in milliseconds - it repairs server-side damage tracking holes under rapid typing.
+# 0 disables it:
+TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 750)
 # `a=f` frame edits are how damaged regions are updated without re-sending the
 # whole image, but not every terminal implementing the graphics protocol has them
 # (kitty does, Ghostty does not): -1 = detect with a probe, 0 = never, 1 = always:
@@ -170,6 +174,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.sigwinch_watch: int = 0
         self.size_confirm_timer: int = 0
         self._pending_size: tuple = ()
+        self.type_refresh_timer: int = 0
         self.probe_timer: int = 0
         self.graphics_ok: bool = False
         # whether the terminal supports `a=f` frame edits (see `FRAME_EDITS`):
@@ -301,6 +306,9 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         if st := self.size_confirm_timer:
             self.size_confirm_timer = 0
             self.source_remove(st)
+        if tt := self.type_refresh_timer:
+            self.type_refresh_timer = 0
+            self.source_remove(tt)
         self._pending_size = ()
         self.cancel_probe_timer()
         self.cancel_frame_probe_timer()
@@ -566,6 +574,33 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             release = KeyEvent(event.code, event.shifted, event.base, event.mods,
                                KEY_RELEASE, event.text)
             kb.handle_key_action(window, make_key_event(release))
+        if event.event_type in (KEY_PRESS, KEY_REPEAT):
+            self.schedule_type_refresh()
+
+    def schedule_type_refresh(self) -> None:
+        """
+        Ask the server to refresh the focused window once a typing burst settles.
+        The server's damage tracking has been observed missing or delaying small
+        updates under rapid typing (glyphs vanishing at line-wrap boundaries,
+        whole bursts arriving minutes late): one refresh per burst repairs any
+        hole and resets a wedged batch, at the cost of a single full-window
+        update per pause.
+        """
+        if TYPE_REFRESH_DELAY <= 0:
+            return
+        if self.type_refresh_timer:
+            self.source_remove(self.type_refresh_timer)
+        self.type_refresh_timer = self.timeout_add(TYPE_REFRESH_DELAY, self.type_refresh)
+
+    def type_refresh(self) -> bool:
+        self.type_refresh_timer = 0
+        wid = self._focused
+        if wid and (window_sub := self.get_subsystem("window")):
+            send_refresh = getattr(window_sub, "send_refresh", None)
+            if callable(send_refresh):
+                keylog("type_refresh() refreshing window %#x", wid)
+                send_refresh(wid)
+        return False
 
     def get_current_modifiers(self) -> Sequence[str]:
         return tuple(self._modifiers)
