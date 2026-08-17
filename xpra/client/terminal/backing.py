@@ -20,6 +20,10 @@ log = Logger("paint", "terminal")
 # turn this off to see exactly which rectangles were painted:
 MERGE_DAMAGE: bool = envbool("XPRA_TERMINAL_MERGE_DAMAGE", True)
 
+# preserve the window contents when the buffer is resized,
+# turn this off to see a resized window blank until the server repaints it:
+COPY_OLD_BACKING: bool = envbool("XPRA_TERMINAL_COPY_OLD_BACKING", True)
+
 # the terminal renders RGBA pixels, so this is the only pixel size we ever store:
 BPP: Final[int] = 4
 
@@ -132,10 +136,34 @@ class TerminalBacking(WindowBackingBase):
         self.render_size = (ww, wh)
         if (bw, bh) != self.size or len(self.pixels) != bw * bh * BPP:
             log("init(%i, %i, %i, %i) reallocating from %s", ww, wh, bw, bh, self.size)
+            oldw, oldh = self.size
+            old_pixels = self.pixels
             self.size = (bw, bh)
             self.pixels = bytearray(bw * bh * BPP)
             self.buffer_serial += 1
             self.damage = []
+            self.copy_old_backing(oldw, oldh, old_pixels)
+
+    def copy_old_backing(self, oldw: int, oldh: int, old_pixels) -> None:
+        """
+        Carry the pixels of the previous buffer over into the newly allocated one,
+        honouring the window gravity, so that a resized window keeps its contents
+        until the server repaints it (this is what the cairo and OpenGL backings do).
+        """
+        bw, bh = self.size
+        if not COPY_OLD_BACKING or oldw <= 0 or oldh <= 0 or len(old_pixels) != oldw * oldh * BPP:
+            return
+        sx, sy, dx, dy, w, h = self.gravity_copy_coords(oldw, oldh, bw, bh)
+        log("copy_old_backing() %ix%i -> %ix%i, gravity=%s, copying %ix%i from %s to %s",
+            oldw, oldh, bw, bh, self.gravity, w, h, (sx, sy), (dx, dy))
+        src_stride = oldw * BPP
+        dst_stride = bw * BPP
+        rowlen = w * BPP
+        pixels = self.pixels
+        for row in range(h):
+            src = (sy + row) * src_stride + sx * BPP
+            dst = (dy + row) * dst_stride + dx * BPP
+            pixels[dst:dst + rowlen] = old_pixels[src:src + rowlen]
 
     def get_info(self) -> dict[str, Any]:
         info = super().get_info()

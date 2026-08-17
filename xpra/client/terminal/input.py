@@ -338,11 +338,21 @@ class InputParser:
         return events
 
     def _force_one(self, buf: bytes, pos: int) -> tuple[int, list[object]]:
-        if buf[pos] == ESC and pos + 1 == len(buf):
-            # a lone `ESC` with nothing following it is the `Escape` key:
+        """
+        Give up on the incomplete sequence at `pos`, which always runs to the end of the buffer.
+        A lone `ESC` is the `Escape` key. Everything else is a truncated escape sequence
+        (or a truncated utf8 character) and is dropped whole: decoding its bytes one at a time
+        would type the sequence's parameters into the focused window, so a `CSI u` key event
+        split by a stall in the byte stream would turn `ESC [ 9 7 ; 1` into `[ 9 7 ; 1`.
+        The cost is `alt` + one of the bytes which start a sequence (`ESC [` is both the start
+        of a control sequence and how a legacy terminal reports `alt` + `[`), which the kitty
+        keyboard protocol reports as an unambiguous `CSI u` event anyway.
+        """
+        size = len(buf) - pos
+        if size == 1 and buf[pos] == ESC:
             return 1, [KeyEvent(KEY_ESCAPE)]
-        log("dropping incomplete input byte %#x", buf[pos])
-        return 1, []
+        log("dropping %i incomplete input bytes: %r", size, buf[pos:])
+        return size, []
 
     def _parse_one(self, buf: bytes, pos: int) -> tuple[int, list[object]]:
         if buf[pos] == ESC:
@@ -395,15 +405,19 @@ class InputParser:
         while i < end and 0x30 <= buf[i] <= 0x3F:
             i += 1
             if i - pos > MAX_ESCAPE:
+                # consume everything scanned so far: re-parsing those bytes
+                # would turn the sequence's parameters into key presses
                 log("giving up on an unterminated control sequence")
-                return 2, []
+                return i - pos, []
         params = buf[start:i]
         start = i
         while i < end and 0x20 <= buf[i] <= 0x2F:
             i += 1
             if i - pos > MAX_ESCAPE:
+                # consume everything scanned so far: re-parsing those bytes
+                # would turn the sequence's parameters into key presses
                 log("giving up on an unterminated control sequence")
-                return 2, []
+                return i - pos, []
         intermediates = buf[start:i]
         if i >= end:
             return NEED_MORE, []
@@ -482,7 +496,7 @@ class InputParser:
             i += 1
             if i - pos > MAX_ESCAPE:
                 log("giving up on an unterminated string sequence")
-                return 2, None
+                return i - pos, None
         return NEED_MORE, None
 
     def _parse_legacy(self, buf: bytes, pos: int, mods: int) -> tuple[int, list[object]]:

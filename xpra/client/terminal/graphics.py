@@ -22,6 +22,10 @@ DECSC: Final[bytes] = b"\x1b7"          # save cursor position
 DECRC: Final[bytes] = b"\x1b8"          # restore cursor position
 CSI: Final[bytes] = b"\x1b["
 
+# the kitty graphics action which transmits animation frame data.
+# it is the one action the protocol requires every continuation chunk to repeat:
+FRAME_ACTION: Final[str] = "a=f"
+
 MAX_U32: Final[int] = 0xFFFFFFFF
 MIN_I32: Final[int] = -0x80000000
 MAX_I32: Final[int] = 0x7FFFFFFF
@@ -53,21 +57,28 @@ def escape(control: str, payload: bytes = b"") -> bytes:
     return APC + control.encode("ascii") + ST
 
 
-def chunked(control: str, payload: bytes) -> bytes:
+def chunked(control: str, payload: bytes, cont: str = "") -> bytes:
     """
     Split an encoded payload into `MAX_CHUNK` sized escape sequences.
     The first chunk carries the full control data, every following chunk carries only `m=`.
     `m=1` means "more data follows", `m=0` terminates the transfer.
     A payload small enough to fit in a single sequence is sent without any `m=` key.
+
+    `cont` is prepended to every continuation chunk: the protocol says
+    "Subsequent chunks must have only the `m` and optionally `q` keys.
+    When sending animation frame data, subsequent chunks must also specify the `a=f` key."
+    Without it the terminal parses the continuations as a whole image transmission
+    and silently replaces the image with the frame data.
     """
     size = len(payload)
     if size <= MAX_CHUNK:
         return escape(control, payload)
+    prefix = f"{cont}," if cont else ""
     parts = [escape(f"{control},m=1", payload[:MAX_CHUNK])]
     pos = MAX_CHUNK
     while pos < size:
         end = min(pos + MAX_CHUNK, size)
-        parts.append(escape("m=%i" % int(end < size), payload[pos:end]))
+        parts.append(escape("%sm=%i" % (prefix, int(end < size)), payload[pos:end]))
         pos = end
     return b"".join(parts)
 
@@ -119,12 +130,12 @@ def patch(image_id: int, x: int, y: int, width: int, height: int, pixels: bytes,
     """
     _check_u32("image id", image_id)
     payload, deflated = encode_pixels(pixels, compress)
-    control = f"a=f,q=2,i={image_id},r=1,x={x},y={y},s={width},v={height}"
+    control = f"{FRAME_ACTION},q=2,i={image_id},r=1,x={x},y={y},s={width},v={height}"
     if deflated:
         control += ",o=z"
     control += ",X=1"
     log("patch(%i, %i, %i, %i, %i, %i bytes, %s)", image_id, x, y, width, height, len(pixels), compress)
-    return chunked(control, payload)
+    return chunked(control, payload, cont=FRAME_ACTION)
 
 
 def delete_placement(image_id: int, placement_id: int) -> bytes:
@@ -147,3 +158,14 @@ def probe(image_id: int) -> bytes:
     """
     _check_u32("image id", image_id)
     return escape(f"a=q,i={image_id},f=32,s=1,v=1,t=d", b64encode(b"\0\0\0\0"))
+
+
+def probe_frame_edit(image_id: int) -> bytes:
+    """
+    A 1x1 frame edit used to detect `a=f` support, which not every terminal
+    implementing the graphics protocol provides (kitty does, Ghostty does not).
+    Not quieted, since we want the terminal's reply.
+    The image must already be held by the terminal (see `transmit`).
+    """
+    _check_u32("image id", image_id)
+    return escape(f"{FRAME_ACTION},i={image_id},r=1,x=0,y=0,s=1,v=1,X=1", b64encode(b"\0\0\0\xff"))

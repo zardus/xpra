@@ -5,7 +5,9 @@
 # later version. See the file COPYING for details.
 
 import unittest
+from unittest.mock import patch
 
+from xpra.constants import Gravity
 from xpra.util.objects import typedict
 
 try:
@@ -139,6 +141,37 @@ class TerminalBackingTest(unittest.TestCase):
         b.init(20, 10, 20, 10)
         self.assertEqual(b.buffer_serial, serial + 1)
         self.assertEqual(len(b.pixels), 20 * 10 * 4)
+
+    def test_init_keeps_the_contents_when_growing(self):
+        b = self.make_backing(4, 2)
+        self.fill(b, 0xEE)
+        b.init(6, 4, 6, 4)
+        # the old 4x2 area is preserved at the top left, the rest is transparent:
+        self.assertEqual(b.pixels_for(0, 0, 4, 2), bytes((0xEE, )) * (4 * 2 * 4))
+        self.assertEqual(b.pixels_for(4, 0, 2, 4), bytes(2 * 4 * 4))
+        self.assertEqual(b.pixels_for(0, 2, 6, 2), bytes(6 * 2 * 4))
+
+    def test_init_keeps_the_contents_when_shrinking(self):
+        b = self.make_backing(8, 8)
+        self.fill(b, 0x11)
+        b.init(4, 4, 4, 4)
+        self.assertEqual(b.pixels_for(0, 0, 4, 4), bytes((0x11, )) * (4 * 4 * 4))
+
+    def test_init_copy_honours_the_window_gravity(self):
+        b = self.make_backing(2, 2)
+        b.gravity = Gravity.SouthEast
+        b.blit(bytes((1, 2, 3, 4)) * 4, 0, 0, 2, 2)
+        b.init(4, 4, 4, 4)
+        # the old contents are anchored to the bottom right corner:
+        self.assertEqual(b.pixels_for(2, 2, 2, 2), bytes((1, 2, 3, 4)) * 4)
+        self.assertEqual(b.pixels_for(0, 0, 4, 2), bytes(4 * 2 * 4))
+
+    def test_init_copy_can_be_disabled(self):
+        b = self.make_backing(4, 2)
+        self.fill(b, 0xEE)
+        with patch.object(terminal_backing, "COPY_OLD_BACKING", False):
+            b.init(6, 4, 6, 4)
+        self.assertEqual(b.pixels, bytearray(6 * 4 * 4))
 
     def test_close_is_idempotent(self):
         b = self.make_backing()

@@ -102,6 +102,16 @@ class KittyKeyboardParserTest(unittest.TestCase):
         self.assertEqual(self.key(b"\x1b[97;1;97u").text, "a")
         self.assertEqual(self.key(b"\x1b[97;1;104:105u").text, "hi")
         self.assertEqual(self.key(b"\x1b[97;1;9731u").text, "☃")
+        # the terminal omits the default modifier group: `CSI <code> ; ; <text> u`
+        event = self.key(b"\x1b[97;;97u")
+        self.assertEqual(event.text, "a")
+        self.assertEqual(event.mods, 0)
+        self.assertEqual(event.event_type, 1)
+        # shift + `a` as reported with both the alternate key and the associated text:
+        event = self.key(b"\x1b[97:65;2;65u")
+        self.assertEqual((event.code, event.shifted, event.mods, event.text), (97, 65, 1, "A"))
+        # an empty text group leaves the text empty:
+        self.assertEqual(self.key(b"\x1b[97;2;u").text, "")
 
     def test_csi_u_all_sections(self):
         event = self.key(b"\x1b[97:65:97;5:2;65u")
@@ -203,6 +213,50 @@ class KittyKeyboardParserTest(unittest.TestCase):
         self.assertEqual(events[0].event_type, 1)
         self.assertEqual(parser.flush(), [])
 
+    def test_flush_drops_a_partial_sequence(self):
+        # a sequence split by a stall in the byte stream must not be typed into the
+        # focused window one parameter byte at a time:
+        for partial in (b"\x1b[97;1", b"\x1b[<0;100", b"\x1b[1;5", b"\x1b[97:65;2;6",
+                        b"\x1b_Gi=3;O", b"\x1b]52;c;QUJ", b"\x1bP1$r0", b"\x1b[3"):
+            parser = terminal_input.InputParser()
+            self.assertEqual(parser.feed(partial), [], f"{partial!r} should stay buffered")
+            self.assertEqual(parser.pending, len(partial))
+            self.assertEqual(parser.flush(), [], f"{partial!r} should be dropped, not decoded")
+            self.assertEqual(parser.pending, 0)
+            self.assertEqual(parser.flush(), [])
+
+    def test_legacy_alt_never_needs_a_flush(self):
+        # `ESC` + a byte which cannot start a longer sequence is `alt` + that key,
+        # and it is complete as soon as it arrives:
+        for data, code in ((b"\x1ba", 97), (b"\x1b1", 49), (b"\x1b.", 46)):
+            parser = terminal_input.InputParser()
+            events = parser.feed(data)
+            self.assertEqual(len(events), 1, f"{data!r}")
+            self.assertEqual(events[0].code, code)
+            self.assertEqual(events[0].mods, terminal_input.MOD_ALT)
+            self.assertEqual(parser.pending, 0)
+
+    def test_flush_drops_a_truncated_sequence_start(self):
+        # `ESC` + a byte which does start a longer sequence is ambiguous: a truncated
+        # sequence, or `alt` + that key on a terminal which does not use the kitty protocol.
+        # it is dropped rather than typed, since the kitty protocol reports those keys as `CSI u`
+        for data in (b"\x1b[", b"\x1b]", b"\x1b_", b"\x1bP", b"\x1b^", b"\x1bX", b"\x1bO"):
+            parser = terminal_input.InputParser()
+            self.assertEqual(parser.feed(data), [])
+            self.assertEqual(parser.flush(), [], f"{data!r} should be dropped")
+            self.assertEqual(parser.pending, 0)
+        # so is a truncated utf8 character:
+        parser = terminal_input.InputParser()
+        self.assertEqual(parser.feed("é".encode()[:1]), [])
+        self.assertEqual(parser.flush(), [])
+
+    def test_flush_after_complete_events(self):
+        # what arrived whole before the truncated tail is still reported:
+        parser = terminal_input.InputParser()
+        events = parser.feed(b"\x1b[97u\x1b[<0;10")
+        self.assertEqual([event.code for event in events], [97])
+        self.assertEqual(parser.flush(), [])
+
     def test_escape_then_more(self):
         parser = terminal_input.InputParser()
         self.assertEqual(parser.feed(b"\x1b"), [])
@@ -280,8 +334,11 @@ class KittyKeyboardParserTest(unittest.TestCase):
         for data in (b"\x1b_G" + b"x" * oversized, b"\x1b[" + b"1" * oversized,
                      b"\x1b]11;" + b"x" * oversized):
             parser = terminal_input.InputParser()
-            parser.feed(data)
+            events = parser.feed(data)
             self.assertEqual(parser.flush(), [], f"{len(data)} bytes should not stay buffered")
+            self.assertEqual(parser.pending, 0)
+            # giving up consumes the bytes already scanned rather than decoding them as keys:
+            self.assertLess(len(events), 1100, f"{len(events)} events from {len(data)} bytes")
 
     def test_split_utf8(self):
         parser = terminal_input.InputParser()
@@ -440,7 +497,76 @@ class TerminalKeysTest(unittest.TestCase):
         key_event = terminal_keys.make_key_event(ev)
         self.assertEqual(key_event.keyname, "A")
         self.assertEqual(key_event.string, "A")
+        self.assertEqual(key_event.keyval, 65)
         self.assertEqual(key_event.modifiers, ["shift"])
+
+    def test_key_text(self):
+        # the associated text wins when the terminal reports it:
+        self.assertEqual(terminal_keys.key_text(
+            terminal_input.KeyEvent(code=97, shifted=65, mods=1, text="A")), "A")
+        # a key release carries no text, so the alternate shifted key is used instead:
+        self.assertEqual(terminal_keys.key_text(
+            terminal_input.KeyEvent(code=97, shifted=65, mods=1, event_type=3)), "A")
+        # without shift the alternate key is not what the key produced:
+        self.assertEqual(terminal_keys.key_text(
+            terminal_input.KeyEvent(code=97, shifted=65)), "")
+        # nothing to fall back on:
+        self.assertEqual(terminal_keys.key_text(terminal_input.KeyEvent(code=97, mods=1)), "")
+        # a functional key is named by its code, never by an alternate code point:
+        self.assertEqual(terminal_keys.key_text(
+            terminal_input.KeyEvent(code=57352, shifted=57352, mods=1)), "")
+        # and neither is a control character:
+        self.assertEqual(terminal_keys.key_text(
+            terminal_input.KeyEvent(code=97, shifted=1, mods=1)), "")
+
+    def test_make_key_event_shifted(self):
+        # the kitty `unicode-key-code` is the unshifted key: reporting `a` with the `shift`
+        # modifier makes the server type `a`, so the shifted code point must be used
+        for code, shifted, keyname, string in (
+            (97, 65, "A", "A"),
+            (50, 64, "at", "@"),
+            (59, 58, "colon", ":"),
+            (47, 63, "question", "?"),
+        ):
+            ev = terminal_input.KeyEvent(code=code, shifted=shifted, mods=1)
+            key_event = terminal_keys.make_key_event(ev)
+            self.assertEqual(key_event.keyname, keyname, f"code {code}")
+            self.assertEqual(key_event.string, string, f"code {code}")
+            self.assertEqual(key_event.keyval, shifted, f"code {code}")
+            self.assertEqual(key_event.modifiers, ["shift"])
+
+    def test_make_key_event_shifted_from_parser(self):
+        # what kitty sends for shift + `a` with the "report alternate keys" flag only,
+        # and with the "report associated text" flag as well:
+        for data in (b"\x1b[97:65;2u", b"\x1b[97:65;2;65u"):
+            events = terminal_input.InputParser().feed(data)
+            self.assertEqual(len(events), 1)
+            key_event = terminal_keys.make_key_event(events[0])
+            self.assertEqual(key_event.keyname, "A", data)
+            self.assertEqual(key_event.string, "A", data)
+            self.assertEqual(key_event.modifiers, ["shift"], data)
+        # the matching release (which never carries any text) must name the same key:
+        events = terminal_input.InputParser().feed(b"\x1b[97:65;2:3u")
+        key_event = terminal_keys.make_key_event(events[0])
+        self.assertEqual(key_event.keyname, "A")
+        self.assertFalse(key_event.pressed)
+        # ctrl + shift + `a` keeps both modifiers:
+        events = terminal_input.InputParser().feed(b"\x1b[97:65;6u")
+        key_event = terminal_keys.make_key_event(events[0])
+        self.assertEqual(key_event.keyname, "A")
+        self.assertEqual(key_event.modifiers, ["shift", "control"])
+
+    def test_make_key_event_unshifted_is_unchanged(self):
+        events = terminal_input.InputParser().feed(b"\x1b[97;1;97u")
+        key_event = terminal_keys.make_key_event(events[0])
+        self.assertEqual(key_event.keyname, "a")
+        self.assertEqual(key_event.string, "a")
+        self.assertEqual(key_event.keyval, 97)
+        self.assertEqual(key_event.modifiers, [])
+        # a legacy (non kitty protocol) key is unaffected:
+        events = terminal_input.InputParser().feed(b"a")
+        key_event = terminal_keys.make_key_event(events[0])
+        self.assertEqual((key_event.keyname, key_event.string, key_event.keyval), ("a", "a", 97))
 
     def test_make_key_event_from_parser(self):
         events = terminal_input.InputParser().feed(b"\x1b[27u\x1b[57441;1:3u\x1ba")

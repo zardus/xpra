@@ -118,6 +118,11 @@ class OSC52Clipboard(ClipboardTimeoutHelper):
         # `get_local_selections` returns whatever the platform has (ie: `PRIMARY`),
         # but OSC 52 only ever addresses the terminal's clipboard:
         self.local_selections = LOCAL_SELECTIONS
+        # a greedy client is one that needs the contents to come with the token:
+        # our proxies are receive-only and never send a clipboard request,
+        # so a token without any data is a token we can do nothing with.
+        # (peers only collect the contents ahead of time for greedy clients)
+        self.local_greedy = LOCAL_SELECTIONS
 
     def __repr__(self):
         return "OSC52Clipboard"

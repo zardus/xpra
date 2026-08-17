@@ -11,6 +11,8 @@ from xpra.keyboard.mask import MODIFIER_MAP, DEFAULT_MODIFIER_MEANINGS
 
 try:
     from xpra.client.terminal import keyboard as terminal_keyboard
+    from xpra.client.terminal.input import parse_mouse_params, MOD_CAPS_LOCK, MOD_NUM_LOCK, MOD_SUPER
+    from xpra.client.terminal.keys import modifier_names
 except ImportError:
     terminal_keyboard = None
 
@@ -35,8 +37,12 @@ class TerminalKeyboardTest(unittest.TestCase):
         keyboard = terminal_keyboard.TerminalKeyboard()
         mod_meanings, mod_managed, mod_pointermissing = keyboard.get_keymap_modifiers()
         self.assertEqual(mod_managed, [])
-        # the terminal reports the lock modifiers with every event:
-        self.assertEqual(mod_pointermissing, [])
+        # SGR mouse reports only have room for `shift`, `mod1` and `control`,
+        # everything else is missing from our pointer events:
+        self.assertEqual(mod_pointermissing, ["lock", "mod2", "mod3", "mod4", "mod5"])
+        # the caller gets a copy it can modify:
+        mod_pointermissing.append("shift")
+        self.assertEqual(keyboard.get_keymap_modifiers()[2], ["lock", "mod2", "mod3", "mod4", "mod5"])
         self.assertTrue(mod_meanings)
         for keyname, modifier in mod_meanings.items():
             self.assertEqual(DEFAULT_MODIFIER_MEANINGS.get(keyname), modifier)
@@ -48,6 +54,25 @@ class TerminalKeyboardTest(unittest.TestCase):
         # the caller gets a copy it can modify:
         mod_meanings["Shift_L"] = "mod5"
         self.assertEqual(keyboard.get_keymap_modifiers()[0]["Shift_L"], "shift")
+
+    def test_pointermissing_matches_the_mouse_reports(self):
+        # an SGR motion report (mode 1003) with every modifier bit the format has:
+        # `ESC [ < 63 ; 10 ; 10 M` - button bits 32+3, modifier bits 4, 8 and 16
+        events = parse_mouse_params(([32 + 3 + 4 + 8 + 16], [10], [10]), ord("M"))
+        self.assertEqual(len(events), 1)
+        reported = modifier_names(events[0].mods)
+        self.assertEqual(sorted(reported), ["control", "mod1", "shift"])
+        mod_pointermissing = terminal_keyboard.TerminalKeyboard().get_keymap_modifiers()[2]
+        # what we do report must not be declared missing:
+        self.assertEqual(set(reported) & set(mod_pointermissing), set())
+        # and everything the server may see in a key event but never in a mouse event must be:
+        declared = set(terminal_keyboard.MOD_MEANINGS.values())
+        self.assertEqual(declared - set(reported), set(mod_pointermissing))
+        # a key event does carry the lock modifiers and `Super`:
+        key_mods = modifier_names(MOD_CAPS_LOCK | MOD_NUM_LOCK | MOD_SUPER)
+        self.assertEqual(sorted(key_mods), ["lock", "mod2", "mod3"])
+        for modifier in key_mods:
+            self.assertIn(modifier, mod_pointermissing, f"{modifier!r} is reported by key events only")
 
     def test_layout_spec(self):
         keyboard = terminal_keyboard.TerminalKeyboard()
@@ -104,6 +129,10 @@ class TerminalKeyboardHelperTest(unittest.TestCase):
         self.assertEqual(props.get("layout"), "us")
         self.assertEqual(list(props.get("layouts")), ["us"])
         self.assertEqual(props.get("mod_meanings"), terminal_keyboard.MOD_MEANINGS)
+        # the server needs this to leave the lock modifiers alone on pointer events:
+        self.assertEqual(props.get("mod_pointermissing"), list(terminal_keyboard.MOD_POINTERMISSING))
+        # empty values are not sent at all, and we have no modifier for the server to manage:
+        self.assertNotIn("mod_managed", props)
         # we have no keycodes to send: the server maps the key names we send instead
         self.assertNotIn("keycodes", props)
         self.assertNotIn("x11_keycodes", props)

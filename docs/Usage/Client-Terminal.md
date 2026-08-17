@@ -43,8 +43,11 @@ work normally. After that the client switches to the alternate screen, hides the
 the terminal in raw mode; all of this is undone when the session ends.
 
 Because the terminal is used for pixels, log output is written elsewhere: to standard error when
-that is not the terminal, otherwise to a file in the directory named by `XPRA_LOG_DIR`
-(`/tmp` by default). Use `-d terminal` to trace the tty setup, graphics and input parsing.
+that is not the terminal, otherwise to `xpra-terminal-<pid>.log` in the first writable directory
+listed by `XPRA_LOG_DIRS` - by default the xpra runtime directory (`/run/user/$UID/xpra`), then
+the system temporary directory. The path is printed before the terminal switches to the alternate
+screen, and if no directory can be written to, the client's own log output is discarded rather
+than drawn over the session. Use `-d terminal` to trace the tty setup, graphics and input parsing.
 
 <div class="docs-section-heading" markdown="1">
 
@@ -81,6 +84,12 @@ terminal that implements it.
 * the mouse cursor is painted by the client as one more image on top of the windows
 * keyboard layout handling is minimal: the terminal reports characters, not keycodes, so
   server side keymaps are not synchronised
+* terminals which implement the graphics protocol without animation frame edits
+  (ie: Ghostty) get every damaged window re-sent whole instead of patched;
+  the client probes for this at startup, `XPRA_TERMINAL_FRAME_EDITS=0|1` overrides it
+* the pixel coordinate base of SGR mouse reports varies between terminals:
+  the client assumes `0` under kitty and `1` everywhere else,
+  `XPRA_TERMINAL_MOUSE_COORDINATE_BASE=0|1` overrides it
 
 <div class="docs-section-heading" markdown="1">
 

@@ -8,6 +8,7 @@ import struct
 import termios
 import threading
 from typing import Final
+from collections.abc import Sequence
 
 from xpra.util.env import envbool, envint
 from xpra.log import Logger
@@ -18,8 +19,10 @@ log = Logger("client", "terminal")
 # enable this to find the ones that do not:
 THREAD_CHECK: Final[bool] = envbool("XPRA_TERMINAL_THREAD_CHECK", False)
 # kitty keyboard protocol flags: 1=disambiguate, 2=report event types,
-# 4=report alternate keys, 8=report all keys as escape codes:
-KEYBOARD_FLAGS: Final[int] = envint("XPRA_TERMINAL_KEYBOARD_FLAGS", 15)
+# 4=report alternate keys, 8=report all keys as escape codes, 16=report associated text.
+# 16 is what tells us that shift+`a` produced `A` rather than `a`, and 4 is the fallback
+# for the key releases which the protocol never reports any text for:
+KEYBOARD_FLAGS: Final[int] = envint("XPRA_TERMINAL_KEYBOARD_FLAGS", 31)
 
 CSI: Final[bytes] = b"\x1b["
 ALT_SCREEN_ON: Final[bytes] = b"\x1b[?1049h"
@@ -29,6 +32,18 @@ CURSOR_SHOW: Final[bytes] = b"\x1b[?25h"
 KEYBOARD_POP: Final[bytes] = b"\x1b[<u"
 # 1002: button event tracking, 1003: any event tracking, 1006: SGR encoding, 1016: SGR pixel encoding
 MOUSE_MODES: Final[tuple[int, ...]] = (1002, 1003, 1006, 1016)
+
+# `TIOCGWINSZ` is the primary source of the terminal's pixel size, but a pty allocated by an
+# intermediary which only forwards rows and columns (`docker exec` and friends) reports zeroes.
+# These are the XTWINOPS queries the kitty graphics protocol documents as the fallback:
+# `CSI 14 t` is answered with `CSI 4 ; <height> ; <width> t` (the text area, in pixels),
+# `CSI 16 t` with `CSI 6 ; <height> ; <width> t` (the pixel size of a single cell):
+TEXT_AREA_QUERY: Final[bytes] = b"\x1b[14t"
+CELL_SIZE_QUERY: Final[bytes] = b"\x1b[16t"
+SIZE_QUERIES: Final[tuple[bytes, ...]] = (TEXT_AREA_QUERY, CELL_SIZE_QUERY)
+# the `kind` of the `CSI <kind> ; ... t` reports those queries are answered with:
+TEXT_AREA_REPORT: Final[int] = 4
+CELL_SIZE_REPORT: Final[int] = 6
 
 # indexes into the list returned by `termios.tcgetattr`:
 IFLAG: Final[int] = 0
@@ -75,6 +90,23 @@ def get_terminal_size(fd: int) -> tuple[int, int, int, int]:
         log("get_terminal_size(%i)", fd, exc_info=True)
         return 0, 0, 0, 0
     return cols, rows, width_px, height_px
+
+
+def cell_size_from_report(kind: int, values: Sequence[int], cols: int = 0, rows: int = 0) -> tuple[int, int]:
+    """
+    The `(width, height)` pixel size of a single terminal cell, derived from a `CSI ... t` report.
+    A cell size report gives it directly, a text area report needs the terminal's `cols` and `rows`.
+    Returns `(0, 0)` for a report we cannot use.
+    """
+    if len(values) < 2 or min(values[:2]) <= 0:
+        return 0, 0
+    height, width = values[0], values[1]
+    if kind == CELL_SIZE_REPORT:
+        return width, height
+    if kind == TEXT_AREA_REPORT and cols > 0 and rows > 0:
+        cell = (width // cols, height // rows)
+        return cell if min(cell) > 0 else (0, 0)
+    return 0, 0
 
 
 class TerminalOutput:
@@ -167,6 +199,8 @@ class TerminalContext:
         output.write(CSI + b">%iu" % KEYBOARD_FLAGS)
         for mode_id in MOUSE_MODES:
             output.write(CSI + b"?%ih" % mode_id)
+        for query in SIZE_QUERIES:
+            output.write(query)
         output.flush()
 
     def exit(self) -> None:

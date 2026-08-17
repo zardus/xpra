@@ -15,13 +15,17 @@ from xpra.exit_codes import ExitCode, ExitValue
 from xpra.platform.paths import get_default_log_dirs
 from xpra.util.env import envint, envbool, osexpand
 from xpra.util.objects import typedict
+from xpra.util.thread import is_main_thread
 from xpra.util.gobject import no_arg_signal
 from xpra.client.base.gobject import GObjectClientAdapter
 from xpra.client.gui.ui_client_base import UIXpraClient
 from xpra.client.terminal import graphics
-from xpra.client.terminal.tty import TerminalOutput, TerminalContext, get_terminal_size
+from xpra.client.terminal.tty import (
+    TerminalOutput, TerminalContext,
+    get_terminal_size, cell_size_from_report, SIZE_QUERIES,
+)
 from xpra.client.terminal.input import (
-    InputParser, KeyEvent, MouseEvent, GraphicsResponse, KeyboardFlagsResponse,
+    InputParser, KeyEvent, MouseEvent, GraphicsResponse, KeyboardFlagsResponse, TextReport,
     KEY_PRESS, KEY_REPEAT, KEY_RELEASE,
 )
 from xpra.client.terminal.keys import make_key_event, modifier_names
@@ -53,6 +57,12 @@ READ_SIZE: Final[int] = envint("XPRA_TERMINAL_READ_SIZE", 8192)
 # how long to wait for the rest of an escape sequence
 # before treating a lone `ESC` as the Escape key (milliseconds):
 INPUT_FLUSH_DELAY: Final[int] = envint("XPRA_TERMINAL_INPUT_FLUSH_DELAY", 50)
+# `a=f` frame edits are how damaged regions are updated without re-sending the
+# whole image, but not every terminal implementing the graphics protocol has them
+# (kitty does, Ghostty does not): -1 = detect with a probe, 0 = never, 1 = always:
+FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", -1)
+# how long to wait for the terminal to answer the frame edit probe, in milliseconds:
+FRAME_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_FRAME_PROBE_TIMEOUT", 1000)
 
 # the image and placement ids we use for things which are not windows:
 PROBE_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 1
@@ -65,6 +75,14 @@ LOG_FORMAT: Final[str] = "%(asctime)s %(message)s"
 KEYBOARD_QUERY: Final[bytes] = b"\x1b[?u"
 # kitty keyboard flag 2: the terminal reports key releases as well as key presses
 KEYBOARD_EVENT_TYPES: Final[int] = 2
+
+# The coordinate base of the SGR pixel mouse reports (mode 1016).
+# `xterm` (which introduced the mode), WezTerm and Ghostty report the same 1-based
+# coordinates as the SGR cell reports the mode extends, but kitty reports them 0-based
+# (`encode_mouse_event_impl` in `kitty/mouse.c` sends the window relative pixel position
+# unmodified), so the base has to be picked per terminal.
+# -1, the default, means: 0 when we are running in kitty, 1 everywhere else.
+MOUSE_COORDINATE_BASE: Final[int] = envint("XPRA_TERMINAL_MOUSE_COORDINATE_BASE", -1)
 
 # SGR mouse buttons 4 to 7 are the wheel, as `(deltax, deltay)`:
 WHEEL_DELTAS: Final[dict[int, tuple[int, int]]] = {
@@ -80,6 +98,16 @@ def is_a_tty(fileobj) -> bool:
         return bool(fileobj) and fileobj.isatty()
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def mouse_coordinate_base() -> int:
+    """ the value to subtract from an SGR pixel mouse report, see `MOUSE_COORDINATE_BASE` """
+    if MOUSE_COORDINATE_BASE >= 0:
+        return MOUSE_COORDINATE_BASE
+    # kitty sets both of these for the processes it starts (`TERM` is `xterm-kitty`):
+    if os.environ.get("KITTY_WINDOW_ID") or "kitty" in os.environ.get("TERM", ""):
+        return 0
+    return 1
 
 
 def find_log_file() -> str:
@@ -138,6 +166,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.sigwinch_watch: int = 0
         self.probe_timer: int = 0
         self.graphics_ok: bool = False
+        # whether the terminal supports `a=f` frame edits (see `FRAME_EDITS`):
+        self.frame_edits: bool = FRAME_EDITS > 0
+        self.frame_probe_sent: bool = False
+        self.frame_probe_timer: int = 0
         self.log_handler = None
         self.saved_log_handlers: list | None = None
         # the terminal only reports key releases when the kitty keyboard protocol
@@ -152,6 +184,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self._zorder: dict[int, int] = {}
         self._focused: int = 0
         # input state, reported back to the subsystems which ask for it:
+        self.mouse_base: int = mouse_coordinate_base()
         self._pointer_pos: tuple[int, int] = (0, 0)
         self._buttons: list[int] = []
         self._modifiers: list[str] = []
@@ -178,6 +211,11 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     # lifecycle
 
     def init(self, opts) -> None:
+        # there is nowhere to put a system tray icon in a terminal
+        # (`get_system_tray_classes()` returns nothing), so the tray forwarding
+        # must not be advertised to the server - it would send us tray windows
+        # we have no way of creating:
+        opts.system_tray = False
         UIXpraClient.init(self, opts)
         # a terminal window has no decorations to put a header bar in:
         self.headerbar = "no"
@@ -253,6 +291,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             self.input_flush_timer = 0
             self.source_remove(ft)
         self.cancel_probe_timer()
+        self.cancel_frame_probe_timer()
+        self.frame_probe_sent = False
         output = self.terminal_output
         self.terminal_output = None
         if output is not None:
@@ -356,9 +396,40 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.idle_add(self.terminal_size_changed)
 
     def terminal_size_changed(self, *_args) -> bool:
-        if self.update_terminal_size() and (display := self.get_subsystem("display")):
+        if not self.update_terminal_size():
+            return True
+        if self.terminal_size[2] <= 0:
+            # this terminal does not report a pixel size, ask it again for its geometry:
+            self.query_terminal_size()
+        if display := self.get_subsystem("display"):
             display.screen_size_changed()
         return True
+
+    def query_terminal_size(self) -> None:
+        """ ask the terminal for its pixel geometry - the answers arrive as `TextReport` events """
+        if output := self.terminal_output:
+            for query in SIZE_QUERIES:
+                output.write(query)
+            output.flush()
+
+    def handle_text_report(self, report: TextReport) -> None:
+        """
+        The answer to one of the `SIZE_QUERIES` (`TerminalContext.enter` sends them):
+        a pty allocated by an intermediary which only forwards rows and columns reports
+        no pixel size at all, and this is the only other way of finding out the cell size.
+        """
+        cols, rows, width, height = self.terminal_size
+        if width > 0 and height > 0:
+            log("ignoring %s, the terminal size is already known: %s", report, self.terminal_size)
+            return
+        cell_width, cell_height = cell_size_from_report(report.kind, report.values, cols, rows)
+        if cols <= 0 or rows <= 0 or cell_width <= 0 or cell_height <= 0:
+            log("ignoring unusable %s", report)
+            return
+        self.terminal_size = (cols, rows, cols * cell_width, rows * cell_height)
+        log("handle_text_report(%s) terminal size=%s", report, self.terminal_size)
+        if display := self.get_subsystem("display"):
+            display.screen_size_changed()
 
     ######################################################################
     # terminal input
@@ -410,6 +481,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
                 self.handle_graphics_response(event)
             elif isinstance(event, KeyboardFlagsResponse):
                 self.handle_keyboard_flags(event)
+            elif isinstance(event, TextReport):
+                self.handle_text_report(event)
             else:
                 log("ignoring terminal event %s", event)
 
@@ -453,9 +526,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         return position
 
     def handle_mouse_event(self, event: MouseEvent) -> None:
-        # SGR pixel reports (mode 1016) are 1-based:
-        x = max(0, event.x - 1)
-        y = max(0, event.y - 1)
+        # the parser reports the coordinates exactly as the terminal sent them,
+        # turn them into terminal pixels (see `mouse_coordinate_base`):
+        x = max(0, event.x - self.mouse_base)
+        y = max(0, event.y - self.mouse_base)
         self._pointer_pos = (x, y)
         self._modifiers = modifier_names(event.mods)
         wid, window = self.hit_test(x, y)
@@ -478,9 +552,12 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
                                                 buttons=tuple(self._buttons))
 
     def send_click(self, wid: int, window, button: int, pressed: bool, pointer) -> None:
-        if button <= 0 or window is None:
+        if button <= 0:
             return
         if pressed:
+            if window is None:
+                # a press on the terminal background: there is nothing to send it to
+                return
             if button not in self._buttons:
                 self._buttons.append(button)
             self.focus_window(wid)
@@ -489,6 +566,9 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
                 self.raise_window(wid)
                 window.refresh_placement()
         elif button in self._buttons:
+            # the release is sent even when the pointer has been dragged out of the window
+            # it was pressed on (`wid` is then 0, ie the root window):
+            # a press which is never released leaves the button held down on the server
             self._buttons.remove(button)
         if w := self.get_subsystem("window"):
             w.send_button(-1, wid, button, pressed, pointer,
@@ -680,8 +760,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
                 self.remove_cursor(output)
                 return
             if serial != self._cursor_serial:
+                # the cursor pixels are RGBA on the wire (see `CursorClient` and the
+                # `raw` cursor images the X11 and Wayland servers produce):
                 output.write(graphics.transmit(graphics.CURSOR_IMAGE_ID, width, height,
-                                               to_rgba("BGRA", pixels, width, height, width * 4)))
+                                               to_rgba("RGBA", pixels, width, height, width * 4)))
                 self._cursor_serial = serial
             cell_width, cell_height = self.cell_size()
             max_width, max_height = self.terminal_pixel_size()
@@ -712,18 +794,62 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         if response.image_id != PROBE_IMAGE_ID:
             log("ignoring graphics response for image %i: %s", response.image_id, response.message)
             return
-        self.cancel_probe_timer()
-        if not response.ok:
-            self.graphics_unsupported(f"the terminal rejected our test image: {response.message}")
+        if not self.graphics_ok:
+            self.cancel_probe_timer()
+            if not response.ok:
+                self.graphics_unsupported(f"the terminal rejected our test image: {response.message}")
+                return
+            log("the terminal supports the kitty graphics protocol")
+            self.graphics_ok = True
+            self.probe_frame_edits()
+            # everything mapped before the probe answered has not been drawn yet:
+            for window in self.get_windows():
+                window.refresh_placement()
             return
-        log("the terminal supports the kitty graphics protocol")
-        self.graphics_ok = True
+        if self.frame_probe_sent:
+            self.frame_probe_sent = False
+            self.cancel_frame_probe_timer()
+            self.frame_edits = response.ok
+            if response.ok:
+                log("the terminal supports frame edits")
+            else:
+                log.info("this terminal does not support frame edits: %s", response.message or "rejected")
+                log.info(" damaged regions will be updated by re-sending the whole image")
+            self.free_probe_image()
+
+    def probe_frame_edits(self) -> None:
+        """ find out if the terminal implements `a=f` frame edits, unless `FRAME_EDITS` forces it """
+        output = self.terminal_output
+        if FRAME_EDITS >= 0 or output is None:
+            self.frame_edits = FRAME_EDITS > 0
+            self.free_probe_image()
+            return
+        self.frame_probe_sent = True
+        # store a real 1x1 image under the probe id, then try to edit its frame:
+        output.write(graphics.transmit(PROBE_IMAGE_ID, 1, 1, b"\x00\x00\x00\x00"))
+        output.write(graphics.probe_frame_edit(PROBE_IMAGE_ID))
+        output.flush()
+        self.frame_probe_timer = self.timeout_add(FRAME_PROBE_TIMEOUT, self.frame_probe_timeout)
+
+    def frame_probe_timeout(self) -> bool:
+        self.frame_probe_timer = 0
+        if self.frame_probe_sent:
+            self.frame_probe_sent = False
+            self.frame_edits = False
+            log.info("the terminal did not answer the frame edit query")
+            log.info(" damaged regions will be updated by re-sending the whole image")
+            self.free_probe_image()
+        return False
+
+    def free_probe_image(self) -> None:
         if output := self.terminal_output:
             output.write(graphics.delete_image(PROBE_IMAGE_ID))
             output.flush()
-        # everything mapped before the probe answered has not been drawn yet:
-        for window in self.get_windows():
-            window.refresh_placement()
+
+    def cancel_frame_probe_timer(self) -> None:
+        if ft := self.frame_probe_timer:
+            self.frame_probe_timer = 0
+            self.source_remove(ft)
 
     def graphics_probe_timeout(self) -> None:
         self.probe_timer = 0
@@ -737,7 +863,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             log.warn(" carrying on because 'XPRA_TERMINAL_PROBE_REQUIRED' is disabled")
             self.graphics_ok = True
             return
-        # `warn_and_quit` quits, which restores the terminal via `cleanup()`:
+        # `warn_and_quit` restores the terminal before it says anything (see below):
         self.warn_and_quit(ExitCode.UNSUPPORTED,
                            "this terminal does not support the kitty graphics protocol:\n"
                            f" {message}")
@@ -746,6 +872,38 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         if pt := self.probe_timer:
             self.probe_timer = 0
             self.source_remove(pt)
+
+    ######################################################################
+    # fatal errors
+
+    def restore_terminal_for_message(self) -> bool:
+        """
+        Leave terminal mode before a message is shown to the user.
+
+        Anything logged while terminal mode is active is written to our log file
+        (see `redirect_logging`) and would land on the alternate screen anyway,
+        which is discarded when the terminal is restored.
+        Returns `False` when the caller has to try again from the UI thread,
+        since the terminal must not be written to from any other thread.
+        """
+        if self.terminal_output is None and self.saved_log_handlers is None:
+            return True
+        if not is_main_thread():
+            return False
+        self.stop_terminal_mode()
+        return True
+
+    def warn_and_quit(self, exit_code: ExitValue, message: str) -> None:
+        if not self.restore_terminal_for_message():
+            self.idle_add(self.warn_and_quit, exit_code, message)
+            return
+        UIXpraClient.warn_and_quit(self, exit_code, message)
+
+    def server_disconnect_warning(self, reason: str, *extra_info) -> None:
+        if not self.restore_terminal_for_message():
+            self.idle_add(self.server_disconnect_warning, reason, *extra_info)
+            return
+        UIXpraClient.server_disconnect_warning(self, reason, *extra_info)
 
     ######################################################################
     # terminal output for the other components
@@ -824,7 +982,9 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             "size": self.terminal_size,
             "cell-size": self.cell_size(),
             "graphics": self.graphics_ok,
+            "frame-edits": self.frame_edits,
             "kitty-keyboard": self.kitty_keyboard,
+            "mouse-coordinate-base": self.mouse_base,
             "stack": tuple(self._stack),
             "override-redirect": tuple(self._or_stack),
             "focused": self._focused,

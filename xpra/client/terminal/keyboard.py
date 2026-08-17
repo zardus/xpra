@@ -10,7 +10,8 @@ from xpra.keyboard.mask import DEFAULT_MODIFIER_MEANINGS
 from xpra.platform import keyboard as platform_keyboard
 from xpra.platform.keyboard_base import KeyboardBase
 from xpra.client.gui.keyboard_helper import KeyboardHelper
-from xpra.client.terminal.keys import FUNCTIONAL_KEYSYMS
+from xpra.client.terminal.input import SGR_MODIFIERS
+from xpra.client.terminal.keys import FUNCTIONAL_KEYSYMS, KITTY_MODIFIERS
 from xpra.log import Logger
 
 log = Logger("keyboard", "terminal")
@@ -27,6 +28,18 @@ MOD_MEANINGS: Final[dict[str, str]] = {
     keyname: modifier for keyname, modifier in DEFAULT_MODIFIER_MEANINGS.items()
     if keyname in frozenset(FUNCTIONAL_KEYSYMS.values())
 }
+# the modifiers a mouse report can carry: SGR reports only have three modifier bits
+# (see `SGR_MODIFIERS` in `xpra.client.terminal.input`), whereas key events carry
+# the whole kitty modifier bitfield:
+POINTER_MODIFIERS: Final[frozenset[str]] = frozenset(
+    KITTY_MODIFIERS[bit] for bit in SGR_MODIFIERS.values() if bit in KITTY_MODIFIERS
+)
+# every other modifier we can send is therefore missing from our pointer events:
+# the lock modifiers, `Super`, `Hyper` and the level 3 shift.
+# the server must leave those alone when it processes a pointer, button or focus packet,
+# or it would press keys we never pressed to clear modifiers we simply cannot report
+# (see `make_keymask_match` in `xpra.x11.server.keyboard_config`):
+MOD_POINTERMISSING: Final[Sequence[str]] = tuple(sorted(set(MOD_MEANINGS.values()) - POINTER_MODIFIERS))
 
 
 class TerminalKeyboard(KeyboardBase):
@@ -43,9 +56,10 @@ class TerminalKeyboard(KeyboardBase):
 
     def get_keymap_modifiers(self) -> tuple[dict, list[str], list[str]]:
         # (mod_meanings, mod_managed, mod_pointermissing):
-        # the terminal reports the caps lock and num lock state with every event,
-        # so the server has no modifier to manage and none are missing from our events:
-        return dict(MOD_MEANINGS), [], []
+        # the terminal reports the caps lock and num lock state with every key event,
+        # so the server has no modifier to manage.
+        # mouse events are another matter: they only carry `shift`, `control` and `mod1`.
+        return dict(MOD_MEANINGS), [], list(MOD_POINTERMISSING)
 
     def get_keymap_spec(self) -> dict[str, Any]:
         # no xkb rules to query: we don't have a local keyboard mapping

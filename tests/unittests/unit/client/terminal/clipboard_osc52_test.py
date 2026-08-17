@@ -7,7 +7,9 @@
 import unittest
 from base64 import b64encode
 
-from xpra.util.objects import AdHocStruct
+from xpra.net.common import Packet
+from xpra.util.objects import AdHocStruct, typedict
+from xpra.clipboard.common import parse_greedy
 from unit.test_util import silence_warn
 
 try:
@@ -69,6 +71,38 @@ class OSC52ClipboardTest(unittest.TestCase):
         self.assertIsInstance(proxy, terminal_clipboard.OSC52ClipboardProxy)
         self.assertTrue(proxy.is_enabled())
         self.assertIn("CLIPBOARD", repr(proxy))
+
+    def test_greedy_capability(self):
+        # this proxy is receive-only and never sends a `clipboard-request`,
+        # so the peer must send the contents with the token: that is what `greedy` asks for
+        helper = self.make_helper()[0]
+        caps = helper.get_caps()
+        self.assertEqual(caps.get("greedy"), ("CLIPBOARD", ))
+        self.assertEqual(tuple(helper.local_greedy), ("CLIPBOARD", ))
+        self.assertTrue(helper.local_greedy_selection("CLIPBOARD"))
+        # what the peer makes of it (`xpra.server.source.clipboard`):
+        self.assertEqual(parse_greedy(typedict(caps), caps["selections"]), ("CLIPBOARD", ))
+
+    def send_token_packet(self, targets, data) -> Packet:
+        """ the wire packet a peer sends for a token with these targets and contents """
+        peer, packets = self.make_helper()
+        peer_proxy = peer._clipboard_proxies["CLIPBOARD"]
+        peer._send_clipboard_token_handler(peer_proxy, {"targets": targets, "data": data})
+        self.assertEqual(len(packets), 1, f"expected a single packet, got {packets}")
+        return Packet(*packets[0])
+
+    def test_token_round_trip(self):
+        helper = self.make_helper()[0]
+        # a greedy client gets the contents with the token:
+        packet = self.send_token_packet(("UTF8_STRING", ),
+                                        {"UTF8_STRING": ("UTF8_STRING", 8, b"from the peer")})
+        helper.process_clipboard_packet(packet)
+        self.assertEqual(helper.osc52_data, [osc52_bytes("from the peer")])
+        # a peer which does not send the contents leaves us with nothing to write,
+        # which is why we must ask for them in the capabilities:
+        helper.osc52_data.clear()
+        helper.process_clipboard_packet(self.send_token_packet((), {}))
+        self.assertEqual(helper.osc52_data, [])
 
     def test_got_token_text(self):
         helper, proxy = self.make_proxy()
@@ -179,6 +213,8 @@ class TerminalClipboardClientTest(unittest.TestCase):
         self.assertEqual(repr(helper), "OSC52Clipboard")
         self.assertTrue(helper.can_send)
         self.assertTrue(helper.can_receive)
+        # the hello capabilities ask the server to push the contents with the token:
+        self.assertEqual(helper.get_caps().get("greedy"), ("CLIPBOARD", ))
         # the writes go to the client's terminal:
         helper.enable_selections(("CLIPBOARD", ))
         proxy = helper._clipboard_proxies["CLIPBOARD"]

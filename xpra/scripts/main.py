@@ -1875,11 +1875,17 @@ def make_client(opts):
             raise InitExit(ExitCode.COMPONENT_MISSING, f"the tk client component is missing: {e}") from None
     if backend == "terminal":
         no_gi_gtk_modules()
-        # the terminal client composes its subsystems from the client features:
-        from xpra.client.base.features import set_client_features
-        set_client_features(opts)
         # the splash screen is a Gtk process which would fight for the terminal:
         opts.splash = False
+        # there is no OpenGL rendering into a terminal
+        # (`get_gl_client_window_module()` never returns one):
+        opts.opengl = "no"
+        # and nowhere to show a system tray icon:
+        opts.system_tray = False
+        # the terminal client composes its subsystems from the client features,
+        # which is why the options above are turned off first:
+        from xpra.client.base.features import set_client_features
+        set_client_features(opts)
         try:
             from xpra.client.terminal.client import make_client as make_terminal_client
             return make_terminal_client(opts)

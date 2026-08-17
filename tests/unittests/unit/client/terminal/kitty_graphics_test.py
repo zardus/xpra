@@ -66,6 +66,7 @@ class TestConstants(unittest.TestCase):
         self.assertEqual(graphics.MAX_CHUNK % 4, 0)
         self.assertEqual(graphics.CURSOR_IMAGE_ID, 0x7FFFFF00)
         self.assertEqual(graphics.CURSOR_Z, 2 ** 30)
+        self.assertEqual(graphics.FRAME_ACTION, "a=f")
 
     def test_escape_without_payload(self):
         self.assertEqual(graphics.escape("a=d,i=1"), b"\x1b_Ga=d,i=1\x1b\\")
@@ -180,15 +181,60 @@ class TestChunking(unittest.TestCase):
         self.assertEqual(escapes[-1][0], "m=0")
         self.assertEqual(b"".join(payload for _, payload in escapes), encoded)
 
-    def test_patch_is_chunked_the_same_way(self):
+    def test_patch_chunks_repeat_the_frame_action(self):
+        # the protocol requires every continuation chunk of an `a=f` transmission to repeat `a=f`:
+        # without it the terminal routes them through the whole image path and replaces the image
         raw_size = graphics.MAX_CHUNK // 4 * 3 + 3
         pixels = raw_pixels(raw_size)
         escapes = split_escapes(graphics.patch(5, 0, 0, 1, raw_size // 4, pixels, compress=False))
         self.assertEqual(len(escapes), 2)
+        self.assertTrue(escapes[0][0].startswith("a=f,"), escapes[0][0])
         self.assertTrue(escapes[0][0].endswith(",m=1"), escapes[0][0])
         self.assertEqual(len(escapes[0][1]), graphics.MAX_CHUNK)
-        self.assertEqual(escapes[1][0], "m=0")
+        self.assertEqual(escapes[1][0], "a=f,m=0")
         self.assertEqual(b"".join(payload for _, payload in escapes), b64encode(pixels))
+
+    def test_patch_many_chunks(self):
+        raw_size = graphics.MAX_CHUNK * 3
+        pixels = raw_pixels(raw_size)
+        encoded = b64encode(pixels)
+        escapes = split_escapes(graphics.patch(5, 2, 4, 1, raw_size // 4, pixels, compress=False))
+        expected = (len(encoded) + graphics.MAX_CHUNK - 1) // graphics.MAX_CHUNK
+        self.assertEqual(len(escapes), expected)
+        self.assertGreater(expected, 2)
+        self.assertEqual(escapes[0][0],
+                         "a=f,q=2,i=5,r=1,x=2,y=4,s=1,v=%i,X=1,m=1" % (raw_size // 4))
+        for control, payload in escapes[1:-1]:
+            self.assertEqual(control, "a=f,m=1")
+            self.assertEqual(len(payload), graphics.MAX_CHUNK)
+            self.assertEqual(len(payload) % 4, 0)
+        self.assertEqual(escapes[-1][0], "a=f,m=0")
+        self.assertLessEqual(len(escapes[-1][1]), graphics.MAX_CHUNK)
+        self.assertEqual(b"".join(payload for _, payload in escapes), encoded)
+
+    def test_patch_golden_two_chunks(self):
+        # the exact bytes of a 2 chunk frame transmission:
+        pixels = raw_pixels(graphics.MAX_CHUNK // 4 * 3 + 3)
+        encoded = b64encode(pixels)
+        data = graphics.patch(5, 0, 0, 1, len(pixels) // 4, pixels, compress=False)
+        self.assertEqual(data,
+                         APC + b"a=f,q=2,i=5,r=1,x=0,y=0,s=1,v=%i,X=1,m=1;" % (len(pixels) // 4) +
+                         encoded[:graphics.MAX_CHUNK] + ST +
+                         APC + b"a=f,m=0;" + encoded[graphics.MAX_CHUNK:] + ST)
+
+    def test_transmit_chunks_carry_no_action(self):
+        # `a=t` is the opposite case: continuation chunks must carry only `m=`
+        raw_size = graphics.MAX_CHUNK * 3
+        _, escapes = self.transmitted(raw_size)
+        for control, _ in escapes[1:]:
+            self.assertNotIn("a=", control)
+
+    def test_chunked_continuation_prefix(self):
+        payload = b"A" * (graphics.MAX_CHUNK * 2)
+        escapes = split_escapes(graphics.chunked("a=x,i=1", payload))
+        self.assertEqual([control for control, _ in escapes], ["a=x,i=1,m=1", "m=0"])
+        escapes = split_escapes(graphics.chunked("a=x,i=1", payload, cont="a=x"))
+        self.assertEqual([control for control, _ in escapes], ["a=x,i=1,m=1", "a=x,m=0"])
 
 
 @unittest.skipIf(graphics is None, "the terminal client graphics module is not available")
@@ -306,6 +352,29 @@ class TestProbe(unittest.TestCase):
     def test_invalid_image_id(self):
         with self.assertRaises(ValueError):
             graphics.probe(-1)
+
+
+@unittest.skipIf(graphics is None, "the terminal client graphics module is not available")
+class TestProbeFrameEdit(unittest.TestCase):
+
+    def test_golden(self):
+        self.assertEqual(graphics.probe_frame_edit(31),
+                         b"\x1b_Ga=f,i=31,r=1,x=0,y=0,s=1,v=1,X=1;AAAA/w==\x1b\\")
+
+    def test_not_quieted(self):
+        # like the transmission probe, we want the terminal's reply:
+        control, payload = split_escapes(graphics.probe_frame_edit(31))[0]
+        self.assertNotIn("q=", control)
+        self.assertEqual(payload, b64encode(b"\0\0\0\xff"))
+
+    def test_edits_frame_one_in_place(self):
+        control = split_escapes(graphics.probe_frame_edit(31))[0][0]
+        for key in ("a=f", "r=1", "X=1", "s=1", "v=1"):
+            self.assertIn(key, control)
+
+    def test_invalid_image_id(self):
+        with self.assertRaises(ValueError):
+            graphics.probe_frame_edit(-1)
 
 
 def main():

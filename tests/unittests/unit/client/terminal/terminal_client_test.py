@@ -5,16 +5,23 @@
 # later version. See the file COPYING for details.
 
 import os
+import sys
+import zlib
 import fcntl
+import signal
+import struct
+import logging
 import termios
 import tempfile
 import unittest
+import subprocess
 from io import BytesIO
+from base64 import b64decode
 from collections.abc import Sequence
 
 from xpra.exit_codes import ExitCode
 from xpra.util.env import OSEnvContext
-from xpra.util.objects import typedict
+from xpra.util.objects import typedict, AdHocStruct
 from xpra.client.base import client as base_client
 from xpra.client.gui import ui_client_base
 from unit.test_util import silence_info, silence_warn
@@ -24,14 +31,16 @@ try:
     from xpra.client.terminal import client as terminal_client
     from xpra.client.terminal import tty as terminal_tty
     from xpra.client.terminal.tty import TerminalOutput
-    from xpra.client.terminal.input import KeyEvent, MouseEvent, GraphicsResponse, KeyboardFlagsResponse
+    from xpra.client.terminal.input import (
+        KeyEvent, MouseEvent, GraphicsResponse, KeyboardFlagsResponse, TextReport,
+    )
     from xpra.client.terminal.subsystem.display import TerminalDisplayClient
 except ImportError:
     graphics = None
     terminal_client = None
     terminal_tty = None
     TerminalOutput = None
-    KeyEvent = MouseEvent = GraphicsResponse = KeyboardFlagsResponse = None
+    KeyEvent = MouseEvent = GraphicsResponse = KeyboardFlagsResponse = TextReport = None
     TerminalDisplayClient = None
 
 # the terminal geometry these tests pretend to run in: (columns, rows, width, height)
@@ -39,6 +48,23 @@ TERMINAL_SIZE = (100, 30, 1000, 600)
 
 # `GLib.IO_IN`, spelled out so that this test package never imports `gi`:
 IO_IN = 1
+
+# what `xpra.scripts.main.make_client` must end up with for `--backend=terminal`,
+# run in a subprocess because it poisons the `gi.repository` Gtk modules process wide:
+MAKE_CLIENT_SCRIPT = """
+from xpra.scripts.config import make_defaults_struct
+from xpra.scripts.main import make_client
+opts = make_defaults_struct()
+opts.backend = "terminal"
+client = make_client(opts)
+client.init(opts)
+client.init_ui(opts)
+from xpra.client.base import features
+print("RESULT opengl=%s systray=%s progress=%s subsystems=,%s,"
+      % (features.opengl, features.systray, features.progress, ",".join(sorted(client.subsystems))))
+print("OPTIONS opengl=%r system_tray=%r splash=%r" % (opts.opengl, opts.system_tray, opts.splash))
+client.cleanup()
+"""
 
 
 class FakeWindow:
@@ -99,6 +125,17 @@ class FakePointerSubsystem:
         self.positions.append((device_id, wid, pos, tuple(modifiers or ()), tuple(buttons or ())))
 
 
+class FakeDisplaySubsystem:
+    def __init__(self):
+        self.screen_changes = 0
+
+    def cleanup(self) -> None:
+        """ the client cleans up every subsystem """
+
+    def screen_size_changed(self) -> None:
+        self.screen_changes += 1
+
+
 class FakeKeyboardSubsystem:
     def __init__(self):
         self.actions: list[tuple] = []
@@ -139,6 +176,9 @@ class TerminalClientTest(unittest.TestCase):
             client = terminal_client.XpraTerminalClient()
         self.addCleanup(client.cleanup)
         client.terminal_size = terminal_size
+        # the mouse coordinate base is detected from the terminal the client runs in,
+        # which must not decide what these tests assert:
+        client.mouse_base = 1
         return client
 
     def make_output(self, client):
@@ -215,6 +255,40 @@ class TerminalClientTest(unittest.TestCase):
         self.assertEqual(client.cell_size(), (10, 20))
         self.assertEqual(client.terminal_pixel_size(), (1000, 600))
 
+    def test_the_pixel_size_is_taken_from_the_terminal_reports(self):
+        # a pty which only forwards rows and columns (`docker exec` and friends):
+        client = self.make_client((80, 24, 0, 0))
+        display = client.subsystems["display"] = FakeDisplaySubsystem()
+        # `CSI 16 t` is answered with `CSI 6 ; <height> ; <width> t`:
+        client.process_input_events([TextReport(6, (20, 10))])
+        self.assertEqual(client.terminal_size, (80, 24, 800, 480))
+        self.assertEqual(client.cell_size(), (10, 20))
+        self.assertEqual(client.terminal_pixel_size(), (800, 480))
+        self.assertEqual(display.screen_changes, 1)
+        # and the pixel size we now have wins over any later report:
+        client.process_input_events([TextReport(6, (40, 20))])
+        self.assertEqual(client.terminal_size, (80, 24, 800, 480))
+        self.assertEqual(display.screen_changes, 1)
+
+    def test_the_text_area_report_is_used_too(self):
+        client = self.make_client((80, 24, 0, 0))
+        # `CSI 14 t` is answered with `CSI 4 ; <height> ; <width> t`:
+        client.process_input_events([TextReport(4, (480, 800))])
+        self.assertEqual(client.terminal_size, (80, 24, 800, 480))
+
+    def test_unusable_terminal_reports_are_ignored(self):
+        client = self.make_client((80, 24, 0, 0))
+        display = client.subsystems["display"] = FakeDisplaySubsystem()
+        for report in (TextReport(6, ()), TextReport(6, (0, 10)), TextReport(4, (10, 10)),
+                       TextReport(8, (20, 10))):
+            client.process_input_events([report])
+            self.assertEqual(client.terminal_size, (80, 24, 0, 0), f"{report} was used")
+        # and a report which arrives when nothing is known cannot be used either:
+        client.terminal_size = (0, 0, 0, 0)
+        client.process_input_events([TextReport(6, (20, 10))])
+        self.assertEqual(client.terminal_size, (0, 0, 0, 0))
+        self.assertEqual(display.screen_changes, 0)
+
     ######################################################################
     # encodings
 
@@ -245,6 +319,66 @@ class TerminalClientTest(unittest.TestCase):
         self.assertEqual(client.get_raw_mouse_position(), (0, 0))
         self.assertEqual(tuple(client.get_current_modifiers()), ())
 
+    def test_the_system_tray_is_turned_off_before_the_subsystems_are_initialized(self):
+        client = self.make_client()
+        opts = AdHocStruct()
+        opts.system_tray = True
+        seen = []
+        # `UIXpraClient.init` initializes every composed subsystem, which needs a full
+        # options object: record what it would have been given instead of running it
+        saved = ui_client_base.UIXpraClient.init
+        ui_client_base.UIXpraClient.init = lambda self, o: seen.append(o.system_tray)
+        try:
+            client.init(opts)
+        finally:
+            ui_client_base.UIXpraClient.init = saved
+        self.assertEqual(seen, [False], "the system tray was still enabled when the subsystems were initialized")
+        self.assertFalse(opts.system_tray)
+        self.assertEqual(client.headerbar, "no")
+
+    def test_tray_windows_are_ignored(self):
+        client = self.make_client()
+        window_sub = client.get_subsystem("window")
+        if window_sub is None:
+            self.skipTest("no `window` subsystem composed")
+        # the client has no way of creating a tray, so it must not claim it has:
+        self.assertFalse(getattr(window_sub, "client_supports_system_tray", False))
+        self.assertFalse(window_sub.get_caps().get("system_tray", False))
+        # and a tray window sent by a server anyway is ignored rather than fatal:
+        from xpra.net.common import Packet
+        from xpra.client.subsystem.window import manager as window_manager
+        metadata = {"tray": True, "title": "nm-applet"}
+        with silence_warn(window_manager):
+            self.assertIsNone(window_sub._process_window_create(
+                Packet("window-create", 10, 0, 0, 24, 24, metadata)))
+
+    def test_make_client_never_looks_at_the_x11_display(self):
+        # this is what `xpra.scripts.main.make_client` calls, and the only thing
+        # keeping the display subsystem's probes away from the X11 bindings:
+        with OSEnvContext():
+            os.environ.pop("XPRA_NOX11", None)
+            os.environ["DISPLAY"] = ":0"
+            with silence_info(ui_client_base):
+                client = terminal_client.make_client(None)
+            self.addCleanup(client.cleanup)
+            self.assertIsInstance(client, terminal_client.XpraTerminalClient)
+            self.assertEqual(os.environ.get("XPRA_NOX11"), "1")
+
+    def test_main_make_client_composes_no_gui_only_subsystem(self):
+        # `make_client` poisons the `gi.repository` Gtk modules process wide,
+        # and the OpenGL warning this pins is emitted on the terminal we run in:
+        proc = subprocess.run([sys.executable, "-c", MAKE_CLIENT_SCRIPT],
+                              capture_output=True, text=True, check=False, timeout=120)
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, output)
+        self.assertIn("RESULT opengl=False systray=False progress=False", output)
+        self.assertIn("OPTIONS opengl='no' system_tray=False splash=False", output)
+        subsystems = output.split("subsystems=")[1].split("\n")[0]
+        for name in ("opengl", "progress"):
+            self.assertNotIn(f",{name},", subsystems, f"the {name!r} subsystem was composed")
+        # nothing may be printed on the terminal before the client even starts:
+        self.assertNotIn("OpenGL", output)
+
     def test_client_window_classes(self):
         client = self.make_client()
         from xpra.client.terminal.window import ClientWindow
@@ -269,6 +403,7 @@ class TerminalClientTest(unittest.TestCase):
             info = client.get_info()
         self.assertEqual(info["terminal"]["size"], TERMINAL_SIZE)
         self.assertEqual(info["terminal"]["cell-size"], (10, 20))
+        self.assertEqual(info["terminal"]["mouse-coordinate-base"], 1)
         self.assertFalse(info["terminal"]["graphics"])
 
     ######################################################################
@@ -297,11 +432,50 @@ class TerminalClientTest(unittest.TestCase):
     def test_graphics_probe_accepted(self):
         client = self.make_client()
         buf = self.make_output(client)
-        client.subsystems["window"] = FakeWindowSubsystem()
+        window_sub = FakeWindowSubsystem()
+        client.subsystems["window"] = window_sub
+        window = FakeWindow(1, (0, 0), (100, 100))
+        window_sub.windows[1] = window
         client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
         self.assertTrue(client.graphics_ok)
+        # the client then probes for `a=f` frame edit support:
+        # a real 1x1 image is stored under the probe id and a frame edit is attempted on it:
+        probe_id = terminal_client.PROBE_IMAGE_ID
+        data = buf.getvalue()
+        self.assertIn(b"a=t,q=2,i=%i" % probe_id, data)
+        self.assertIn(b"a=f,i=%i" % probe_id, data)
+        self.assertTrue(client.frame_probe_sent)
+        # every window mapped before the terminal answered is placed again:
+        self.assertEqual(window.placements, 1)
+        # the terminal answers the frame edit probe:
+        client.handle_graphics_response(GraphicsResponse(probe_id, True, "OK"))
+        self.assertTrue(client.frame_edits)
+        self.assertFalse(client.frame_probe_sent)
         # the test image is freed again:
         self.assertIn(b"a=d,d=I", buf.getvalue())
+
+    def test_frame_edits_rejected(self):
+        client = self.make_client()
+        buf = self.make_output(client)
+        probe_id = terminal_client.PROBE_IMAGE_ID
+        client.handle_graphics_response(GraphicsResponse(probe_id, True, "OK"))
+        self.assertTrue(client.frame_probe_sent)
+        # a terminal without `a=f` support rejects the frame edit:
+        client.handle_graphics_response(GraphicsResponse(probe_id, False, "ENOTSUP"))
+        self.assertFalse(client.frame_edits)
+        self.assertFalse(client.frame_probe_sent)
+        self.assertIn(b"a=d,d=I", buf.getvalue())
+
+    def test_frame_edit_probe_timeout(self):
+        client = self.make_client()
+        self.make_output(client)
+        probe_id = terminal_client.PROBE_IMAGE_ID
+        client.handle_graphics_response(GraphicsResponse(probe_id, True, "OK"))
+        self.assertTrue(client.frame_probe_sent)
+        # a terminal which ignores the frame edit never answers:
+        client.frame_probe_timeout()
+        self.assertFalse(client.frame_edits)
+        self.assertFalse(client.frame_probe_sent)
 
     def test_graphics_response_for_another_image_is_ignored(self):
         client = self.make_client()
@@ -385,11 +559,50 @@ class TerminalClientTest(unittest.TestCase):
                                      KeyEvent(ord("a"), event_type=3, text="a")])
         self.assertEqual([a[2] for a in kb.actions], [True, False])
 
+    def test_mouse_coordinate_base(self):
+        with OSEnvContext():
+            os.environ.pop("KITTY_WINDOW_ID", None)
+            # every terminal but kitty reports mode 1016 coordinates 1-based:
+            os.environ["TERM"] = "xterm-256color"
+            self.assertEqual(terminal_client.mouse_coordinate_base(), 1)
+            os.environ["TERM"] = "xterm-kitty"
+            self.assertEqual(terminal_client.mouse_coordinate_base(), 0)
+            os.environ["TERM"] = "screen"
+            os.environ["KITTY_WINDOW_ID"] = "1"
+            self.assertEqual(terminal_client.mouse_coordinate_base(), 0)
+            # and the tunable wins over the detection:
+            saved = terminal_client.MOUSE_COORDINATE_BASE
+            terminal_client.MOUSE_COORDINATE_BASE = 1
+            try:
+                self.assertEqual(terminal_client.mouse_coordinate_base(), 1)
+            finally:
+                terminal_client.MOUSE_COORDINATE_BASE = saved
+
+    def test_the_client_picks_up_the_mouse_coordinate_base(self):
+        with OSEnvContext():
+            os.environ.pop("KITTY_WINDOW_ID", None)
+            os.environ["TERM"] = "xterm-kitty"
+            with silence_info(ui_client_base):
+                client = terminal_client.XpraTerminalClient()
+            self.addCleanup(client.cleanup)
+            self.assertEqual(client.mouse_base, 0)
+
+    def test_zero_based_mouse_reports(self):
+        # a terminal which reports mode 1016 coordinates 0-based (kitty):
+        client, window_sub = self.make_input_client()
+        client.mouse_base = 0
+        self.add_window(client, window_sub, 1, (100, 100), (100, 100))
+        # the top left pixel of the window must hit that window, not the background:
+        client.process_input_events([MouseEvent(100, 100, 1, "press", 0)])
+        self.assertEqual(client.get_raw_mouse_position(), (100, 100))
+        self.assertEqual([(b[1], b[2], b[3]) for b in window_sub.buttons], [(1, 1, True)])
+
     def test_mouse_motion(self):
         client, window_sub = self.make_input_client()
         self.add_window(client, window_sub, 1, (20, 40), (100, 100))
         pointer = client.subsystems["pointer"]
-        # SGR pixel coordinates are 1-based:
+        # SGR pixel coordinates are 1-based on this terminal:
+        self.assertEqual(client.mouse_base, 1)
         client.process_input_events([MouseEvent(31, 51, 0, "motion", 0)])
         self.assertEqual(client.get_raw_mouse_position(), (30, 50))
         self.assertEqual(pointer.positions, [(-1, 1, (30, 50, 10, 10), (), ())])
@@ -414,12 +627,28 @@ class TerminalClientTest(unittest.TestCase):
         self.assertEqual(window_sub.buttons[0][6], (1, ))
         self.assertEqual(window_sub.buttons[1][6], ())
 
-    def test_mouse_button_outside_any_window_is_dropped(self):
+    def test_mouse_press_outside_any_window_is_dropped(self):
         client, window_sub = self.make_input_client()
         self.add_window(client, window_sub, 1, (0, 0), (10, 10))
         client.process_input_events([MouseEvent(500, 500, 1, "press", 0)])
         self.assertEqual(window_sub.buttons, [])
         self.assertEqual(client._buttons, [])
+
+    def test_mouse_release_outside_any_window_is_still_sent(self):
+        # dragging out of a window and releasing there must not leave the button held down
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        client.process_input_events([MouseEvent(11, 21, 1, "press", 0),
+                                     MouseEvent(501, 501, 1, "release", 0)])
+        self.assertEqual(client._buttons, [])
+        self.assertEqual([(b[1], b[2], b[3]) for b in window_sub.buttons],
+                         [(1, 1, True), (0, 1, False)])
+        # the release is reported at the root window position:
+        self.assertEqual(window_sub.buttons[1][4], (500, 500, 500, 500))
+        # and the next press is delivered normally:
+        client.process_input_events([MouseEvent(11, 21, 1, "press", 0)])
+        self.assertEqual(client._buttons, [1])
+        self.assertEqual([(b[1], b[2], b[3]) for b in window_sub.buttons][-1:], [(1, 1, True)])
 
     def test_wheel(self):
         client, window_sub = self.make_input_client()
@@ -449,6 +678,16 @@ class TerminalClientTest(unittest.TestCase):
         pixels = bytes((1, 2, 3, 255)) * (width * height)
         return ("raw", 0, 0, width, height, xhot, yhot, serial, pixels, "default")
 
+    def transmitted_pixels(self, data: bytes) -> bytes:
+        """ decode the payload of the `a=t` image transmission found in what we wrote """
+        start = data.index(b"\x1b_Ga=t")
+        end = data.index(b"\x1b\\", start)
+        control, _, payload = data[start + 3:end].partition(b";")
+        pixels = b64decode(payload)
+        if b",o=z" in control:
+            pixels = zlib.decompress(pixels)
+        return pixels
+
     def test_cursor_is_transmitted_and_placed_at_the_hotspot(self):
         client = self.make_client()
         buf = self.make_output(client)
@@ -457,6 +696,8 @@ class TerminalClientTest(unittest.TestCase):
         data = buf.getvalue()
         image_id = graphics.CURSOR_IMAGE_ID
         self.assertIn(b"a=t,q=2,i=%i,f=32,s=4,v=4" % image_id, data)
+        # the cursor pixels are RGBA on the wire and the terminal expects RGBA:
+        self.assertEqual(self.transmitted_pixels(data), bytes((1, 2, 3, 255)) * 16)
         # (105-1, 63-2) with 10x20 cells: row 4, column 11, offsets (4, 1)
         self.assertIn(b"\x1b[4;11H", data)
         self.assertIn(b"a=p,q=2,i=%i,p=1,z=%i,C=1,X=4,Y=1" % (image_id, graphics.CURSOR_Z), data)
@@ -569,6 +810,8 @@ class TerminalModeTest(unittest.TestCase):
         self.addCleanup(self.client.cleanup)
         self.client.terminal_fd = self.slave
         self.client.terminal_size = TERMINAL_SIZE
+        # the tests must not depend on the terminal they are running in:
+        self.client.mouse_base = 1
         self.client.make_terminal_output = self.make_terminal_output
 
     def make_terminal_output(self):
@@ -622,6 +865,8 @@ class TerminalModeTest(unittest.TestCase):
             self.assertIn(expected, data)
         # the log output has been redirected away from the terminal:
         self.assertIsNotNone(client.saved_log_handlers)
+        # and the terminal resizes are watched:
+        self.assertTrue(client.sigwinch_watch or signal.getsignal(signal.SIGWINCH) == client.handle_sigwinch)
 
         client.cleanup()
         data = self.read_terminal()
@@ -672,6 +917,77 @@ class TerminalModeTest(unittest.TestCase):
         self.assertEqual(client.get_raw_mouse_position(), (100, 50))
         self.assertEqual(client.subsystems["pointer"].positions,
                          [(-1, 1, (100, 50, 100, 50), (), ())])
+
+    def test_terminal_resize_updates_the_geometry(self):
+        client = self.client
+        client.start_terminal_mode()
+        self.read_terminal()
+        display = FakeDisplaySubsystem()
+        client.subsystems["display"] = display
+        # `struct winsize`: rows, columns, width and height in pixels
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 132, 1584, 1100))
+        self.assertTrue(client.terminal_size_changed())
+        self.assertEqual(client.terminal_size, (132, 50, 1584, 1100))
+        self.assertEqual(client.cell_size(), (12, 22))
+        self.assertEqual(client.terminal_pixel_size(), (1584, 1100))
+        self.assertEqual(display.screen_changes, 1)
+        # a `SIGWINCH` which does not change the size costs nothing:
+        self.assertFalse(client.update_terminal_size())
+        self.assertTrue(client.terminal_size_changed())
+        self.assertEqual(display.screen_changes, 1)
+        # the terminal reports its pixel size, so there is nothing to ask it:
+        self.assertEqual(self.read_terminal(), b"")
+
+    def test_a_resize_without_a_pixel_size_queries_the_terminal(self):
+        client = self.client
+        client.start_terminal_mode()
+        self.read_terminal()
+        client.subsystems["display"] = FakeDisplaySubsystem()
+        # a pty which only forwards rows and columns (`docker exec` and friends):
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 132, 0, 0))
+        self.assertTrue(client.terminal_size_changed())
+        self.assertEqual(client.terminal_size, (132, 50, 0, 0))
+        data = self.read_terminal()
+        self.assertIn(b"\x1b[14t", data)
+        self.assertIn(b"\x1b[16t", data)
+        # and the terminal's answer gives us the cell size:
+        self.write_terminal(b"\x1b[6;22;12t")
+        self.assertEqual(client.terminal_size, (132, 50, 132 * 12, 50 * 22))
+        self.assertEqual(client.cell_size(), (12, 22))
+
+    def test_sigwinch_is_handled_on_the_main_loop(self):
+        client = self.client
+        scheduled: list = []
+        # a signal handler must not touch the terminal itself:
+        client.idle_add = lambda fn, *args: scheduled.append((fn, args))
+        client.handle_sigwinch(signal.SIGWINCH, None)
+        self.assertEqual(scheduled, [(client.terminal_size_changed, ())])
+
+    def test_a_fatal_error_is_reported_after_the_terminal_is_restored(self):
+        client = self.client
+        records: list[str] = []
+
+        class RecordingHandler(logging.Handler):
+            def emit(self, record) -> None:
+                records.append(record.getMessage())
+
+        handler = RecordingHandler()
+        logging.root.addHandler(handler)
+        self.addCleanup(logging.root.removeHandler, handler)
+        client.start_terminal_mode()
+        self.read_terminal()
+        # while the terminal is in graphics mode, our own output goes to the log file:
+        self.assertNotIn(handler, logging.root.handlers)
+        client.probe_timer = 0
+        client.graphics_probe_timeout()
+        self.assertEqual(client.exit_code, ExitCode.UNSUPPORTED)
+        # the terminal (and the logging) is restored before the reason is given,
+        # or the user would never see it:
+        self.assertIsNone(client.terminal_output)
+        self.assertIn(b"\x1b[?1049l", self.read_terminal())
+        self.assertIn(handler, logging.root.handlers)
+        self.assertTrue([r for r in records if "kitty graphics protocol" in r],
+                        f"the failure was not reported to the user: {records}")
 
     def test_closed_terminal_quits(self):
         client = self.client

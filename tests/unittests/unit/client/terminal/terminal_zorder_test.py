@@ -343,6 +343,10 @@ class TerminalZOrderTest(unittest.TestCase):
         w2 = self.make_window(2)
         w2.present()
         self.assertEqual(self.window_sub._focused, 2)
+        # the client's own focus state (which key events are routed with)
+        # has to follow, or the keystrokes keep going to the previous window:
+        self.assertEqual(self.client._focused, 2)
+        self.assertTrue(w2.has_toplevel_focus())
 
     def test_click_focuses_the_topmost_window(self):
         self.make_window(1, (0, 0, 100, 100))

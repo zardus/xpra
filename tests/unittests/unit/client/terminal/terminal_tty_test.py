@@ -19,7 +19,9 @@ except ImportError:
     tty_module = None
 
 # the exact byte sequences the terminal context is contracted to emit:
-ENTER = b"\x1b[?1049h\x1b[?25l\x1b[>15u\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h"
+ENTER = (b"\x1b[?1049h\x1b[?25l\x1b[>31u"
+         b"\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h"
+         b"\x1b[14t\x1b[16t")
 EXIT = b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[<u\x1b[?25h\x1b[?1049l"
 
 
@@ -131,8 +133,16 @@ class TestTerminalContext(unittest.TestCase):
         return self.buf.getvalue()
 
     def test_defaults(self):
-        self.assertEqual(tty_module.KEYBOARD_FLAGS, 15)
+        # 31 = 1 disambiguate | 2 event types | 4 alternate keys | 8 all keys as escapes
+        # | 16 report associated text.
+        # 16 is what makes shift + `a` arrive as `A`, and 2 must stay set:
+        # the client uses it to decide whether the terminal reports key releases
+        self.assertEqual(tty_module.KEYBOARD_FLAGS, 31)
+        for bit in (1, 2, 4, 8, 16):
+            self.assertTrue(tty_module.KEYBOARD_FLAGS & bit, f"keyboard flag {bit} is not requested")
         self.assertEqual(tty_module.MOUSE_MODES, (1002, 1003, 1006, 1016))
+        self.assertEqual(tty_module.SIZE_QUERIES, (b"\x1b[14t", b"\x1b[16t"))
+        self.assertEqual((tty_module.TEXT_AREA_REPORT, tty_module.CELL_SIZE_REPORT), (4, 6))
 
     def test_enter_sequence(self):
         self.assertFalse(self.context.active)
@@ -146,11 +156,13 @@ class TestTerminalContext(unittest.TestCase):
         expected_order = (
             b"\x1b[?1049h",     # alternate screen first
             b"\x1b[?25l",       # then hide the cursor
-            b"\x1b[>15u",       # then push the kitty keyboard flags
+            b"\x1b[>31u",       # then push the kitty keyboard flags
             b"\x1b[?1002h",     # then the mouse modes, in ascending order
             b"\x1b[?1003h",
             b"\x1b[?1006h",
             b"\x1b[?1016h",
+            b"\x1b[14t",        # then ask for the text area and cell pixel sizes
+            b"\x1b[16t",
         )
         positions = [data.index(seq) for seq in expected_order]
         self.assertEqual(positions, sorted(positions))
@@ -280,6 +292,44 @@ class TestTerminalSize(unittest.TestCase):
         os.close(read_fd)
         os.close(write_fd)
         self.assertEqual(tty_module.get_terminal_size(read_fd), (0, 0, 0, 0))
+
+
+@unittest.skipIf(tty_module is None, "the terminal client tty module is not available")
+class TestCellSizeFromReport(unittest.TestCase):
+    """ `CSI 14 t` / `CSI 16 t` are the fallback when `TIOCGWINSZ` reports no pixel size """
+
+    def call(self, kind, values, cols=0, rows=0):
+        return tty_module.cell_size_from_report(kind, values, cols, rows)
+
+    def test_cell_size_report(self):
+        # `CSI 6 ; <height> ; <width> t`:
+        self.assertEqual(self.call(tty_module.CELL_SIZE_REPORT, (17, 8)), (8, 17))
+        # the terminal size is irrelevant for this report:
+        self.assertEqual(self.call(tty_module.CELL_SIZE_REPORT, (20, 10), 80, 24), (10, 20))
+
+    def test_text_area_report(self):
+        # `CSI 4 ; <height> ; <width> t` divided by the terminal size:
+        self.assertEqual(self.call(tty_module.TEXT_AREA_REPORT, (408, 640), 80, 24), (8, 17))
+        # without the terminal size it cannot be used:
+        self.assertEqual(self.call(tty_module.TEXT_AREA_REPORT, (408, 640)), (0, 0))
+
+    def test_unusable_reports(self):
+        for kind, values, cols, rows in (
+            (tty_module.CELL_SIZE_REPORT, (), 0, 0),            # no values
+            (tty_module.CELL_SIZE_REPORT, (17, ), 0, 0),        # only one value
+            (tty_module.CELL_SIZE_REPORT, (0, 8), 0, 0),        # a zero dimension
+            (tty_module.CELL_SIZE_REPORT, (17, -1), 0, 0),      # a missing value
+            (tty_module.TEXT_AREA_REPORT, (10, 10), 80, 24),    # smaller than one cell
+            (8, (100, 200), 80, 24),                            # a report we did not ask for
+        ):
+            self.assertEqual(self.call(kind, values, cols, rows), (0, 0), f"kind {kind} {values}")
+
+    def test_from_the_parser(self):
+        from xpra.client.terminal.input import InputParser
+        events = InputParser().feed(b"\x1b[6;20;10t")
+        self.assertEqual(len(events), 1)
+        report = events[0]
+        self.assertEqual(tty_module.cell_size_from_report(report.kind, report.values), (10, 20))
 
 
 def main():

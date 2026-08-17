@@ -92,6 +92,7 @@ class FakeClient:
     # a title template with a variable, so the metadata title is used:
     title = "@title@"
     headerbar = "no"
+    frame_edits = True
 
     def __init__(self, cell=(10, 20), pixel_size=(800, 480)):
         self.packets = []
@@ -137,6 +138,14 @@ class FakeClient:
     def restack_window(self, wid: int, other_wid: int, above: int) -> None:
         self.restacked.append((wid, other_wid, above))
         self.zorder[wid] = 44
+
+    def focus_window(self, wid: int) -> None:
+        # this mirrors `XpraTerminalClient.focus_window`:
+        # the client's own focus state is what key events are routed with
+        if self._focused == wid:
+            return
+        self._focused = wid
+        self.subsystems["window"].update_focus(wid, True)
 
     # test helpers:
     def drain(self) -> bytes:
@@ -259,6 +268,41 @@ class TerminalWindowTest(unittest.TestCase):
         # the properties have been consumed:
         self.assertEqual(dict(window._client_properties), {})
 
+    def test_override_redirect_does_not_send_map(self):
+        # the server maps override-redirect windows itself and rejects map packets for them:
+        client, window = self.make_window(override_redirect=True)
+        window.show_all()
+        self.assertNotIn(WINDOW_MAP, client.packet_types())
+        # the client properties are delivered without any geometry instead:
+        config = client.last_packet(WINDOW_CONFIGURE)[2]
+        self.assertNotIn("geometry", config)
+        props = config["properties"]
+        self.assertEqual(tuple(props["encodings.rgb_formats"]), tuple(TerminalBacking.RGB_MODES))
+        self.assertEqual(props["encoding.render-size"], (64, 32))
+        self.assertEqual(dict(window._client_properties), {})
+        # the window is still shown:
+        self.assertEqual(actions(client.commands()), ["t", "p"])
+
+    def test_override_redirect_does_not_send_unmap(self):
+        client, window = self.make_window(override_redirect=True)
+        window.show_all()
+        client.drain()
+        client.packets = []
+        window.hide()
+        self.assertEqual(client.packet_types(), [])
+        # the placement is still removed:
+        self.assertEqual(actions(client.commands()), ["d"])
+
+    def test_override_redirect_resize_sends_the_client_properties(self):
+        client, window = self.make_window(override_redirect=True)
+        window.show_all()
+        client.drain()
+        client.packets = []
+        window.resize(100, 50)
+        config = client.last_packet(WINDOW_CONFIGURE)[2]
+        self.assertNotIn("geometry", config)
+        self.assertEqual(config["properties"]["encoding.render-size"], (100, 50))
+
     def test_show_transmits_and_places(self):
         client, window = self.make_window()
         window.show_all()
@@ -324,6 +368,19 @@ class TerminalWindowTest(unittest.TestCase):
         self.assertEqual(patch["r"], "1")
         self.assertEqual(patch["X"], "1")
 
+    def test_no_frame_edits_retransmits_the_image(self):
+        # a terminal without `a=f` support gets the whole image again instead of a patch:
+        client, window = self.make_window()
+        window.show_all()
+        client.drain()
+        client.frame_edits = False
+        calls = self.paint(window, 2, 3, 4, 4)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0])
+        commands = client.commands()
+        self.assertEqual(actions(commands), ["t", "p"])
+        self.assertNotIn("f", actions(commands))
+
     def test_draw_region_flush_defers_the_patch(self):
         client, window = self.make_window()
         window.show_all()
@@ -367,13 +424,39 @@ class TerminalWindowTest(unittest.TestCase):
         window.repaint(1000, 1000, 10, 10)
         self.assertEqual(client.drain(), b"")
 
-    def test_redraw_patches_the_whole_window(self):
+    def test_redraw_does_not_re_encode_unchanged_pixels(self):
+        # `redraw_windows()` calls this at 10Hz whilst the server is unresponsive:
         client, window = self.make_window()
         window.show_all()
         client.drain()
         window.redraw()
+        window.redraw()
+        self.assertEqual(client.drain(), b"")
+
+    def test_redraw_presents_the_pending_damage(self):
+        client, window = self.make_window()
+        window.show_all()
+        client.drain()
+        # a paint that is part of a group is not presented yet:
+        self.paint(window, 2, 3, 4, 4, flush=1)
+        self.assertEqual(client.drain(), b"")
+        window.redraw()
         patch = graphics_keys(client.commands(), "f")[0]
-        self.assertEqual((patch["x"], patch["y"], patch["s"], patch["v"]), ("0", "0", "64", "32"))
+        self.assertEqual((patch["x"], patch["y"], patch["s"], patch["v"]), ("2", "3", "4", "4"))
+        # and it is not sent twice:
+        window.redraw()
+        self.assertEqual(client.drain(), b"")
+
+    def test_redraw_retransmits_a_reallocated_buffer(self):
+        client, window = self.make_window()
+        window.show_all()
+        client.drain()
+        window.freeze()
+        window.resize(100, 50)
+        client.drain()
+        window._frozen = False
+        window.redraw()
+        self.assertEqual(actions(client.commands()), ["t", "p"])
 
     def test_paint_reaches_the_backing(self):
         client, window = self.make_window()
@@ -466,6 +549,25 @@ class TerminalWindowTest(unittest.TestCase):
         commands = client.commands()
         self.assertEqual(actions(commands), ["p"])
         self.assertEqual(graphics_keys(commands, "p")[0]["z"], "42")
+        self.assertEqual(client.subsystems["window"].focus_events, [(1, True)])
+
+    def test_present_focuses_the_window_in_the_client(self):
+        # the client's focus state is what key events are routed with,
+        # leaving it stale sends the keystrokes to the previously focused window:
+        client, window = self.make_window()
+        other_client, other = self.make_window(client, wid=2, geom=(0, 0, 10, 10))
+        client._focused = 2
+        window.show_all()
+        window.present()
+        self.assertEqual(client._focused, 1)
+        self.assertTrue(window.has_toplevel_focus())
+        self.assertFalse(other.has_toplevel_focus())
+
+    def test_present_falls_back_to_the_window_subsystem(self):
+        client, window = self.make_window()
+        client.focus_window = None
+        window.show_all()
+        window.present()
         self.assertEqual(client.subsystems["window"].focus_events, [(1, True)])
 
     def test_restack(self):

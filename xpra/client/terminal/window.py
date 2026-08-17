@@ -120,6 +120,10 @@ class ClientWindow(ClientWindowBase):
         width, height = pixel_size()
         return width, height
 
+    def frame_edits_supported(self) -> bool:
+        """ whether the terminal can patch a damaged region with an `a=f` frame edit """
+        return bool(getattr(self._client, "frame_edits", True))
+
     def window_z(self) -> int:
         """ the kitty `z` index the client assigned to this window """
         window_z = getattr(self._client, "window_z", None)
@@ -205,6 +209,16 @@ class ClientWindow(ClientWindowBase):
         backing.add_damage(x, y, w, h)
         self.present_damage()
 
+    def redraw(self) -> None:
+        """
+        The superclass repaints the whole window here, to refresh the alert spinner
+        this backend does not render. Re-encoding the whole buffer costs
+        (up to megabytes of) terminal output for a pixel-identical result,
+        and `redraw_windows()` runs at 10Hz for as long as the server is unresponsive,
+        so only the damage that is actually pending is presented.
+        """
+        self.present_damage()
+
     def can_write(self) -> bool:
         return self._mapped and not self._frozen and self.terminal_output() is not None
 
@@ -213,8 +227,9 @@ class ClientWindow(ClientWindowBase):
         backing = self._backing
         if output is None or backing is None or not self._mapped or self._frozen:
             return
-        if self._transmitted_serial != backing.buffer_serial:
-            # the buffer was (re)allocated, the terminal has nothing to patch:
+        if self._transmitted_serial != backing.buffer_serial or not self.frame_edits_supported():
+            # the buffer was (re)allocated so the terminal has nothing to patch,
+            # or this terminal cannot patch at all (no `a=f` frame edit support):
             if self.transmit_image(output):
                 output.flush()
             return
@@ -236,7 +251,12 @@ class ClientWindow(ClientWindowBase):
     def show(self) -> None:
         self._mapped = True
         self._been_mapped = True
-        self.send_map()
+        if self._override_redirect:
+            # the server maps override-redirect windows itself and rejects map packets for them,
+            # the client properties still have to reach it somehow:
+            self.send_client_properties()
+        else:
+            self.send_map()
         output = self.terminal_output()
         if output is not None:
             self.transmit_image(output)
@@ -263,7 +283,9 @@ class ClientWindow(ClientWindowBase):
         if output is not None:
             self.remove_placement(output)
             output.flush()
-        self.send(WINDOW_UNMAP, self.wid)
+        if not self._override_redirect:
+            # the server rejects unmap packets for override-redirect windows:
+            self.send(WINDOW_UNMAP, self.wid)
 
     def destroy(self) -> None:
         log("destroy() window %#x", self.wid)
@@ -293,8 +315,11 @@ class ClientWindow(ClientWindowBase):
             self.set_backing_size(w, h)
         if moved or resized:
             self.refresh_placement()
-        if not self._override_redirect:
-            # the server owns the geometry of override-redirect windows:
+        if self._override_redirect:
+            # the server owns the geometry of override-redirect windows,
+            # only the client properties are ours to send:
+            self.send_client_properties()
+        else:
             self.send_configure()
 
     def resize(self, w: int, h: int, resize_counter: int = 0) -> None:
@@ -333,6 +358,20 @@ class ClientWindow(ClientWindowBase):
         geomlog("sending configure for %#x: %s", self.wid, config)
         self.send(WINDOW_CONFIGURE, self.wid, config)
 
+    def send_client_properties(self) -> None:
+        """
+        Send the backing's client properties on their own, without any geometry:
+        this is the only way to deliver them for override-redirect windows,
+        whose map and configure geometry the server refuses.
+        """
+        props = dict(self._client_properties)
+        if not props:
+            return
+        self._client_properties = typedict()
+        config: dict[str, Any] = {"properties": props}
+        geomlog("sending client properties for %#x: %s", self.wid, config)
+        self.send(WINDOW_CONFIGURE, self.wid, config)
+
     def initiate_moveresize(self, x_root: int, y_root: int, direction: int, button: int,
                             source_indication: int) -> None:
         geomlog("initiate_moveresize%s is not supported by the terminal client",
@@ -346,7 +385,12 @@ class ClientWindow(ClientWindowBase):
         if raise_window:
             raise_window(self.wid)
         self.refresh_placement()
-        if window := self.get_subsystem("window"):
+        # the client owns the focus state that key events are routed with,
+        # and it forwards the focus to the window subsystem:
+        focus_window = getattr(self._client, "focus_window", None)
+        if focus_window:
+            focus_window(self.wid)
+        elif window := self.get_subsystem("window"):
             window.update_focus(self.wid, True)
 
     def restack(self, other_window, above: int = 0) -> None:

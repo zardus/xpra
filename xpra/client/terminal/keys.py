@@ -132,6 +132,25 @@ def keysym_name_for(code: int, text: str) -> str:
     return ""
 
 
+def key_text(ev: TerminalKeyEvent) -> str:
+    """
+    The text a key produced.
+    The kitty keyboard protocol reports it directly under the "report associated text" flag,
+    but never for a key release and never for a key which only produces control codes.
+    When it is missing, the "shifted" alternate code point (reported under the
+    "report alternate keys" flag) is what the key produces while `shift` is held:
+    without it, the `A` we send to the server would be an `a`.
+    """
+    if ev.text:
+        return ev.text
+    shifted = ev.shifted
+    if ev.mods & MOD_SHIFT and 0 < shifted <= 0x10FFFF and shifted not in FUNCTIONAL_KEYSYMS:
+        char = chr(shifted)
+        if char.isprintable():
+            return char
+    return ""
+
+
 def modifier_names(kitty_mods: int) -> list[str]:
     """ the canonical xpra modifier names for a kitty modifier bitfield """
     mask = 0
@@ -150,12 +169,14 @@ def keyval_for(code: int) -> int:
 
 def make_key_event(ev: TerminalKeyEvent) -> KeyEvent:
     """ turn a terminal key event into the `KeyEvent` the keyboard subsystem expects """
+    text = key_text(ev)
     key_event = KeyEvent()
-    key_event.keyname = keysym_name_for(ev.code, ev.text)
+    key_event.keyname = keysym_name_for(ev.code, text)
     key_event.pressed = ev.event_type in (KEY_PRESS, KEY_REPEAT)
     key_event.modifiers = modifier_names(ev.mods)
-    key_event.string = ev.text
-    key_event.keyval = keyval_for(ev.code)
+    key_event.string = text
+    # the code point the key actually produced, so that the keyval matches the keysym name:
+    key_event.keyval = keyval_for(ord(text) if len(text) == 1 else ev.code)
     key_event.keycode = 0
     key_event.group = 0
     log("make_key_event(%s)=%s", ev, key_event)
