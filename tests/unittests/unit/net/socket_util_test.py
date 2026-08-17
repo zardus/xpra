@@ -320,6 +320,21 @@ class TestCloseSockets(unittest.TestCase):
         assert cleanup_called
 
 
+def has_ipv6() -> bool:
+    """
+        `socket.has_ipv6` only tells us that Python was built with IPv6 support,
+        it does not tell us that this host can create an IPv6 socket:
+        kernels booted with `ipv6.disable=1` and many containers cannot.
+    """
+    if not socket.has_ipv6:
+        return False
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+    except OSError:
+        return False
+    return True
+
+
 class TestCreateTcpSocket(unittest.TestCase):
 
     def test_ipv4(self):
@@ -330,8 +345,8 @@ class TestCreateTcpSocket(unittest.TestCase):
             sock.close()
 
     def test_ipv6(self):
-        if not socket.has_ipv6:
-            return
+        if not has_ipv6():
+            self.skipTest("no IPv6 support on this host")
         sock = create_tcp_socket("::1", 0)
         try:
             assert sock.family == socket.AF_INET6
