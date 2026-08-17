@@ -518,6 +518,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
                 self._or_stack.append(wid)
         elif wid not in self._stack:
             self._stack.append(wid)
+            # a freshly created regular window takes the focus if nothing has it,
+            # otherwise the keyboard would be dead until the user clicks:
+            if not self._focused:
+                self.focus_window(wid)
         log("_new_window(%s) stack=%s, override-redirect=%s", window, self._stack, self._or_stack)
         self.update_zorder()
 
@@ -530,6 +534,9 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self._zorder.pop(wid, None)
         if self._focused == wid:
             self._focused = 0
+            # focus falls back to the window now at the top of the stack:
+            if self._stack:
+                self.focus_window(self._stack[-1])
         self.update_zorder()
 
     def destroy_window(self, wid: int, window) -> None:

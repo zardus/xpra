@@ -301,8 +301,7 @@ class TerminalZOrderTest(unittest.TestCase):
     def test_focus_transitions(self):
         w1 = self.make_window(1)
         w2 = self.make_window(2)
-        self.assertFalse(w1.has_toplevel_focus())
-        self.client.focus_window(1)
+        # the first regular window took the focus when it was created:
         self.assertTrue(w1.has_toplevel_focus())
         self.assertFalse(w2.has_toplevel_focus())
         self.client.focus_window(2)
@@ -310,6 +309,34 @@ class TerminalZOrderTest(unittest.TestCase):
         self.assertTrue(w2.has_toplevel_focus())
         # the window subsystem was told about it:
         self.assertEqual(self.window_sub._focused, 2)
+
+    def test_first_window_takes_the_focus(self):
+        # without this, the keyboard is dead until the user clicks:
+        self.make_window(1)
+        self.assertEqual(self.client._focused, 1)
+        # later windows do not steal it:
+        self.make_window(2)
+        self.assertEqual(self.client._focused, 1)
+
+    def test_override_redirect_does_not_take_the_focus(self):
+        self.make_window(1, override_redirect=True)
+        self.assertEqual(self.client._focused, 0)
+        # the first regular window still does, even after an override-redirect one:
+        self.make_window(2)
+        self.assertEqual(self.client._focused, 2)
+
+    def test_destroy_focus_falls_back_to_the_top(self):
+        self.make_window(1)
+        self.make_window(2)
+        self.make_window(3)
+        self.client.focus_window(3)
+        self.destroy(3)
+        # focus falls back to the window now at the top of the stack:
+        self.assertEqual(self.client._focused, 2)
+        self.destroy(2)
+        self.assertEqual(self.client._focused, 1)
+        self.destroy(1)
+        self.assertEqual(self.client._focused, 0)
 
     def test_present_takes_the_focus(self):
         self.make_window(1)

@@ -355,12 +355,14 @@ class TerminalClientTest(unittest.TestCase):
 
     def test_key_events_go_to_the_focused_window(self):
         client, window_sub = self.make_input_client()
-        window = self.add_window(client, window_sub, 1, (0, 0), (100, 100))
         kb = client.subsystems["keyboard"]
-        # no window has the focus yet, so the event is dropped:
+        # no window exists yet, so the event is dropped:
         client.process_input_events([KeyEvent(ord("a"), text="a")])
         self.assertEqual(kb.actions, [])
-        client.focus_window(1)
+        # the first regular window takes the focus as soon as it is created,
+        # so the keyboard works without requiring a click first:
+        window = self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        self.assertEqual(client._focused, 1)
         client.kitty_keyboard = True
         client.process_input_events([KeyEvent(ord("a"), mods=4, event_type=1, text="a")])
         self.assertEqual(kb.actions, [(window, "a", True, ("control", ))])
