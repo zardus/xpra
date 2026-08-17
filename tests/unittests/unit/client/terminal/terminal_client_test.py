@@ -657,10 +657,29 @@ class TerminalClientTest(unittest.TestCase):
         self.assertEqual(client.get_raw_mouse_position(), (100, 100))
         self.assertEqual([(b[1], b[2], b[3]) for b in window_sub.buttons], [(1, 1, True)])
 
+    def test_focus_parks_the_pointer_until_real_mouse_input(self):
+        # without this, a fresh session has a dead keyboard until the first click:
+        # when `XSetInputFocus` does not take effect the X focus stays on
+        # `PointerRoot` and keys are routed to the window under the pointer,
+        # which starts wherever the vfb put it
+        client, window_sub = self.make_input_client()
+        pointer = client.subsystems["pointer"]
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        self.assertEqual(pointer.positions, [(-1, 1, (50, 50, 50, 50), (), ())])
+        # a real mouse event ends the parking:
+        client.process_input_events([MouseEvent(11, 21, 0, "motion", 0)])
+        self.assertTrue(client._pointer_synced)
+        pointer.positions.clear()
+        self.add_window(client, window_sub, 2, (0, 0), (50, 50))
+        client.focus_window(2)
+        self.assertEqual(pointer.positions, [])
+
     def test_mouse_motion(self):
         client, window_sub = self.make_input_client()
         self.add_window(client, window_sub, 1, (20, 40), (100, 100))
         pointer = client.subsystems["pointer"]
+        # focusing the new window parked the pointer at its center:
+        self.assertEqual(pointer.positions.pop(0), (-1, 1, (70, 90, 50, 50), (), ()))
         # SGR pixel coordinates are 1-based on this terminal:
         self.assertEqual(client.mouse_base, 1)
         client.process_input_events([MouseEvent(31, 51, 0, "motion", 0)])
@@ -671,6 +690,7 @@ class TerminalClientTest(unittest.TestCase):
         client, window_sub = self.make_input_client()
         self.add_window(client, window_sub, 1, (20, 40), (10, 10))
         pointer = client.subsystems["pointer"]
+        pointer.positions.clear()      # drop the focus-time pointer parking
         client.process_input_events([MouseEvent(500, 500, 0, "motion", 0)])
         self.assertEqual(pointer.positions, [(-1, 0, (499, 499, 499, 499), (), ())])
 
@@ -975,8 +995,8 @@ class TerminalModeTest(unittest.TestCase):
                          [(window, "a", True, ())])
         self.write_terminal(b"\x1b[<35;101;51M")
         self.assertEqual(client.get_raw_mouse_position(), (100, 50))
-        self.assertEqual(client.subsystems["pointer"].positions,
-                         [(-1, 1, (100, 50, 100, 50), (), ())])
+        self.assertEqual(client.subsystems["pointer"].positions[-1],
+                         (-1, 1, (100, 50, 100, 50), (), ()))
 
     def test_terminal_resize_updates_the_geometry(self):
         client = self.client

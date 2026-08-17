@@ -187,6 +187,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         # input state, reported back to the subsystems which ask for it:
         self.mouse_base: int = mouse_coordinate_base()
         self._pointer_pos: tuple[int, int] = (0, 0)
+        # `True` once a real mouse event has arrived from the terminal:
+        self._pointer_synced: bool = False
         self._buttons: list[int] = []
         self._modifiers: list[str] = []
         # cursor state:
@@ -539,6 +541,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         return position
 
     def handle_mouse_event(self, event: MouseEvent) -> None:
+        # the user is driving the pointer now, `may_sync_pointer` must not fight it:
+        self._pointer_synced = True
         # the parser reports the coordinates exactly as the terminal sent them,
         # turn them into terminal pixels (see `mouse_coordinate_base`):
         x = max(0, event.x - self.mouse_base)
@@ -722,6 +726,30 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self._focused = wid
         if w := self.get_subsystem("window"):
             w.update_focus(wid, True)
+        self.may_sync_pointer(wid)
+
+    def may_sync_pointer(self, wid: int) -> None:
+        """
+        Until the user actually touches the mouse, park the server's pointer inside
+        the focused window.  A GUI client's pointer is naturally over its windows,
+        but ours starts wherever the vfb put it - and when the server's
+        `XSetInputFocus` does not take effect, the X input focus stays on
+        `PointerRoot` and every key press is routed to the window under the
+        pointer: with the pointer outside every window, the keyboard is dead
+        until the first click.
+        """
+        if self._pointer_synced:
+            return
+        window = self.get_window(wid)
+        pointer = self.get_subsystem("pointer")
+        if window is None or pointer is None:
+            return
+        x, y = window._pos
+        w, h = window._size
+        cx, cy = x + w // 2, y + h // 2
+        pointerlog("may_sync_pointer(%#x) parking the pointer at %s", wid, (cx, cy))
+        self._pointer_pos = (cx, cy)
+        pointer.send_mouse_position(-1, wid, (cx, cy, w // 2, h // 2), self._modifiers, self._buttons)
 
     def hit_test(self, x: int, y: int) -> tuple[int, Any]:
         """ the topmost mapped window containing this terminal pixel """
