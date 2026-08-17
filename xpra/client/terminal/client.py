@@ -58,6 +58,9 @@ READ_SIZE: Final[int] = envint("XPRA_TERMINAL_READ_SIZE", 8192)
 # how long to wait for the rest of an escape sequence
 # before treating a lone `ESC` as the Escape key (milliseconds):
 INPUT_FLUSH_DELAY: Final[int] = envint("XPRA_TERMINAL_INPUT_FLUSH_DELAY", 50)
+# how long to wait before adopting a suspicious terminal size reading
+# (one without pixel dimensions after a reading which had them), in milliseconds:
+SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
 # `a=f` frame edits are how damaged regions are updated without re-sending the
 # whole image, but not every terminal implementing the graphics protocol has them
 # (kitty does, Ghostty does not): -1 = detect with a probe, 0 = never, 1 = always:
@@ -165,6 +168,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.input_watch: int = 0
         self.input_flush_timer: int = 0
         self.sigwinch_watch: int = 0
+        self.size_confirm_timer: int = 0
+        self._pending_size: tuple = ()
         self.probe_timer: int = 0
         self.graphics_ok: bool = False
         # whether the terminal supports `a=f` frame edits (see `FRAME_EDITS`):
@@ -293,6 +298,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         if ft := self.input_flush_timer:
             self.input_flush_timer = 0
             self.source_remove(ft)
+        if st := self.size_confirm_timer:
+            self.size_confirm_timer = 0
+            self.source_remove(st)
+        self._pending_size = ()
         self.cancel_probe_timer()
         self.cancel_frame_probe_timer()
         self.frame_probe_sent = False
@@ -399,14 +408,47 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.idle_add(self.terminal_size_changed)
 
     def terminal_size_changed(self, *_args) -> bool:
-        if not self.update_terminal_size():
+        size = get_terminal_size(self.terminal_fd) if self.terminal_fd >= 0 else (0, 0, 0, 0)
+        if size == (0, 0, 0, 0) or size == self.terminal_size:
             return True
-        if self.terminal_size[2] <= 0:
+        if size[2] <= 0 and self.terminal_size[2] > 0:
+            # The terminal reported a pixel size before, but this reading has none:
+            # that is what a transient glitch looks like (adopting it would shrink
+            # the whole session to a guessed size, and some vfbs cannot grow back).
+            # Keep the current size, ask again, and only adopt the new geometry
+            # if a second reading confirms it:
+            log.warn("Warning: the terminal stopped reporting its pixel size")
+            log.warn(" got %r, keeping %r until it is confirmed", size, self.terminal_size)
+            self._pending_size = size[:2]
+            if not self.size_confirm_timer:
+                self.size_confirm_timer = self.timeout_add(SIZE_CONFIRM_DELAY, self.confirm_terminal_size)
+            self.query_terminal_size()
+            return True
+        self.adopt_terminal_size(size)
+        return True
+
+    def confirm_terminal_size(self) -> bool:
+        self.size_confirm_timer = 0
+        pending = self._pending_size
+        self._pending_size = ()
+        size = get_terminal_size(self.terminal_fd) if self.terminal_fd >= 0 else (0, 0, 0, 0)
+        if size == (0, 0, 0, 0) or size == self.terminal_size:
+            return False
+        if size[2] <= 0 and tuple(size[:2]) != tuple(pending):
+            # still no pixels and not even a stable report - keep what we have:
+            log("confirm_terminal_size() unstable readings %s vs %s, ignoring", size, pending)
+            return False
+        self.adopt_terminal_size(size)
+        return False
+
+    def adopt_terminal_size(self, size: tuple[int, int, int, int]) -> None:
+        log("adopt_terminal_size() %s -> %s", self.terminal_size, size)
+        self.terminal_size = size
+        if size[2] <= 0:
             # this terminal does not report a pixel size, ask it again for its geometry:
             self.query_terminal_size()
         if display := self.get_subsystem("display"):
             display.screen_size_changed()
-        return True
 
     def query_terminal_size(self) -> None:
         """ ask the terminal for its pixel geometry - the answers arrive as `TextReport` events """

@@ -1022,10 +1022,12 @@ class TerminalModeTest(unittest.TestCase):
 
     def test_a_resize_without_a_pixel_size_queries_the_terminal(self):
         client = self.client
+        # a pty which only forwards rows and columns (`docker exec` and friends)
+        # never had a pixel size to begin with:
+        client.terminal_size = (120, 40, 0, 0)
         client.start_terminal_mode()
         self.read_terminal()
         client.subsystems["display"] = FakeDisplaySubsystem()
-        # a pty which only forwards rows and columns (`docker exec` and friends):
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 132, 0, 0))
         self.assertTrue(client.terminal_size_changed())
         self.assertEqual(client.terminal_size, (132, 50, 0, 0))
@@ -1036,6 +1038,57 @@ class TerminalModeTest(unittest.TestCase):
         self.write_terminal(b"\x1b[6;22;12t")
         self.assertEqual(client.terminal_size, (132, 50, 132 * 12, 50 * 22))
         self.assertEqual(client.cell_size(), (12, 22))
+
+    def test_a_pixel_less_reading_is_quarantined(self):
+        # the terminal reported pixels before: a sudden pixel-less 80x24 reading
+        # is what a transient glitch looks like - adopting it instantly would
+        # shrink the whole session to a guessed size (and some vfbs cannot grow
+        # back), so it must be confirmed by a second reading first:
+        client = self.client
+        client.start_terminal_mode()
+        self.read_terminal()
+        display = FakeDisplaySubsystem()
+        client.subsystems["display"] = display
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        with silence_warn(terminal_client):
+            self.assertTrue(client.terminal_size_changed())
+        # nothing is adopted yet:
+        self.assertEqual(client.terminal_size, TERMINAL_SIZE)
+        self.assertEqual(display.screen_changes, 0)
+        self.assertEqual(client._pending_size, (80, 24))
+        self.assertNotEqual(client.size_confirm_timer, 0)
+        # the terminal is asked for its geometry again:
+        data = self.read_terminal()
+        self.assertIn(b"\x1b[14t", data)
+        self.assertIn(b"\x1b[16t", data)
+        # a stable second reading is adopted:
+        client.source_remove(client.size_confirm_timer)
+        client.size_confirm_timer = 0
+        client._pending_size = (80, 24)
+        self.assertFalse(client.confirm_terminal_size())
+        self.assertEqual(client.terminal_size, (80, 24, 0, 0))
+        self.assertEqual(display.screen_changes, 1)
+
+    def test_a_transient_size_glitch_is_ignored(self):
+        client = self.client
+        client.start_terminal_mode()
+        self.read_terminal()
+        display = FakeDisplaySubsystem()
+        client.subsystems["display"] = display
+        rows, cols = TERMINAL_SIZE[1], TERMINAL_SIZE[0]
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        with silence_warn(terminal_client):
+            self.assertTrue(client.terminal_size_changed())
+        self.assertEqual(client.terminal_size, TERMINAL_SIZE)
+        # the terminal recovers before the confirmation runs:
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, TERMINAL_SIZE[2], TERMINAL_SIZE[3]))
+        client.source_remove(client.size_confirm_timer)
+        client.size_confirm_timer = 0
+        self.assertFalse(client.confirm_terminal_size())
+        # the glitch never reached the server:
+        self.assertEqual(client.terminal_size, TERMINAL_SIZE)
+        self.assertEqual(display.screen_changes, 0)
 
     def test_sigwinch_is_handled_on_the_main_loop(self):
         client = self.client
