@@ -1,0 +1,190 @@
+# This file is part of Xpra.
+# Copyright (C) 2026 Yan Shoshitaishvili <yans@pwn.college>
+# Xpra is released under the terms of the GNU GPL v2, or, at your option, any
+# later version. See the file COPYING for details.
+
+import fcntl
+import struct
+import termios
+import threading
+from typing import Final
+
+from xpra.util.env import envbool, envint
+from xpra.log import Logger
+
+log = Logger("client", "terminal")
+
+# all terminal writes must happen on the GLib main loop thread,
+# enable this to find the ones that do not:
+THREAD_CHECK: Final[bool] = envbool("XPRA_TERMINAL_THREAD_CHECK", False)
+# kitty keyboard protocol flags: 1=disambiguate, 2=report event types,
+# 4=report alternate keys, 8=report all keys as escape codes:
+KEYBOARD_FLAGS: Final[int] = envint("XPRA_TERMINAL_KEYBOARD_FLAGS", 15)
+
+CSI: Final[bytes] = b"\x1b["
+ALT_SCREEN_ON: Final[bytes] = b"\x1b[?1049h"
+ALT_SCREEN_OFF: Final[bytes] = b"\x1b[?1049l"
+CURSOR_HIDE: Final[bytes] = b"\x1b[?25l"
+CURSOR_SHOW: Final[bytes] = b"\x1b[?25h"
+KEYBOARD_POP: Final[bytes] = b"\x1b[<u"
+# 1002: button event tracking, 1003: any event tracking, 1006: SGR encoding, 1016: SGR pixel encoding
+MOUSE_MODES: Final[tuple[int, ...]] = (1002, 1003, 1006, 1016)
+
+# indexes into the list returned by `termios.tcgetattr`:
+IFLAG: Final[int] = 0
+OFLAG: Final[int] = 1
+CFLAG: Final[int] = 2
+LFLAG: Final[int] = 3
+CC: Final[int] = 6
+
+# the flags `cfmakeraw` clears, see POSIX.1-2017 chapter 11 "General Terminal Interface":
+IFLAG_RAW_MASK: Final[int] = (termios.BRKINT | termios.ICRNL | termios.IGNBRK | termios.IGNCR |
+                              termios.IGNPAR | termios.INLCR | termios.INPCK | termios.ISTRIP |
+                              termios.IXANY | termios.IXOFF | termios.IXON | termios.PARMRK)
+LFLAG_RAW_MASK: Final[int] = (termios.ECHO | termios.ECHOE | termios.ECHOK | termios.ECHONL |
+                              termios.ICANON | termios.IEXTEN | termios.ISIG | termios.NOFLSH |
+                              termios.TOSTOP)
+
+WINSIZE_FORMAT: Final[str] = "HHHH"      # struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel
+WINSIZE_ZERO: Final[bytes] = b"\0" * 8
+
+
+def make_raw(mode) -> None:
+    """ apply `cfmakeraw` semantics in place to a mode list obtained from `termios.tcgetattr` """
+    mode[IFLAG] &= ~IFLAG_RAW_MASK
+    mode[OFLAG] &= ~termios.OPOST
+    mode[CFLAG] = (mode[CFLAG] & ~(termios.CSIZE | termios.PARENB)) | termios.CS8
+    mode[LFLAG] &= ~LFLAG_RAW_MASK
+    # non canonical input, MIN=1 TIME=0: a read blocks until at least one byte is available
+    cc = list(mode[CC])
+    cc[termios.VMIN] = 1
+    cc[termios.VTIME] = 0
+    mode[CC] = cc
+
+
+def get_terminal_size(fd: int) -> tuple[int, int, int, int]:
+    """
+    Query the terminal geometry: `(cols, rows, width_px, height_px)`.
+    Terminals that do not report a pixel size return zeroes for the last two values,
+    and everything is zero when the file descriptor is not a terminal.
+    """
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, WINSIZE_ZERO)
+        rows, cols, width_px, height_px = struct.unpack(WINSIZE_FORMAT, packed)
+    except (OSError, ValueError, struct.error):
+        log("get_terminal_size(%i)", fd, exc_info=True)
+        return 0, 0, 0, 0
+    return cols, rows, width_px, height_px
+
+
+class TerminalOutput:
+    """
+    The single writer to the terminal.
+    The file object is injected so that tests can capture the bytes we emit.
+    """
+    __slots__ = ("fileobj", "failed")
+
+    def __init__(self, fileobj):
+        self.fileobj = fileobj
+        self.failed = False
+
+    def __repr__(self):
+        return f"TerminalOutput({self.fileobj})"
+
+    def check_thread(self) -> None:
+        if not THREAD_CHECK:
+            return
+        current = threading.current_thread()
+        if current is not threading.main_thread():
+            log.error("Error: terminal output used from thread %r", current.name)
+            log.error(" all terminal writes must happen on the UI thread")
+
+    def write(self, data: bytes) -> None:
+        if self.failed or not data:
+            return
+        self.check_thread()
+        try:
+            self.fileobj.write(data)
+        except (OSError, ValueError) as e:
+            self.failed = True
+            log("write(%i bytes)", len(data), exc_info=True)
+            log.warn("Warning: cannot write to the terminal")
+            log.warn(f" {e}")
+
+    def flush(self) -> None:
+        if self.failed:
+            return
+        self.check_thread()
+        try:
+            self.fileobj.flush()
+        except (OSError, ValueError) as e:
+            self.failed = True
+            log("flush()", exc_info=True)
+            log.warn("Warning: cannot flush the terminal output")
+            log.warn(f" {e}")
+
+
+class TerminalContext:
+    """
+    Owns the terminal modes: raw input, alternate screen, hidden cursor,
+    the kitty keyboard protocol flags and the mouse reporting modes.
+    `exit` undoes exactly what `enter` did, in reverse order, and is idempotent.
+    """
+    __slots__ = ("fd", "output", "saved", "entered")
+
+    def __init__(self, fd: int, output: TerminalOutput):
+        self.fd = fd
+        self.output = output
+        self.saved = None
+        self.entered = False
+
+    def __repr__(self):
+        return f"TerminalContext({self.fd}, active={self.entered})"
+
+    @property
+    def active(self) -> bool:
+        return self.entered
+
+    def enter(self) -> None:
+        if self.entered:
+            return
+        try:
+            self.saved = termios.tcgetattr(self.fd)
+            mode = termios.tcgetattr(self.fd)
+            make_raw(mode)
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, mode)
+        except (termios.error, OSError) as e:
+            # not a terminal, or a terminal we cannot configure:
+            # still emit the escape sequences, the output may be a pipe into a real terminal
+            self.saved = None
+            log("enter()", exc_info=True)
+            log.warn("Warning: cannot switch the terminal to raw mode")
+            log.warn(f" {e}")
+        self.entered = True
+        output = self.output
+        output.write(ALT_SCREEN_ON)
+        output.write(CURSOR_HIDE)
+        output.write(CSI + b">%iu" % KEYBOARD_FLAGS)
+        for mode_id in MOUSE_MODES:
+            output.write(CSI + b"?%ih" % mode_id)
+        output.flush()
+
+    def exit(self) -> None:
+        if not self.entered:
+            return
+        self.entered = False
+        output = self.output
+        for mode_id in reversed(MOUSE_MODES):
+            output.write(CSI + b"?%il" % mode_id)
+        output.write(KEYBOARD_POP)
+        output.write(CURSOR_SHOW)
+        output.write(ALT_SCREEN_OFF)
+        output.flush()
+        saved = self.saved
+        self.saved = None
+        if saved is None:
+            return
+        try:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+        except (termios.error, OSError):
+            log("exit()", exc_info=True)

@@ -54,6 +54,7 @@ CYTHONIZE_MORE_PACKAGES = {
     "xpra.client.gtk3.subsystem", "xpra.client.gtk3.window", "xpra.client.gui",
     "xpra.client.gui.window", "xpra.client.pyglet", "xpra.client.qt6",
     "xpra.client.subsystem", "xpra.client.subsystem.window", "xpra.client.tk",
+    "xpra.client.terminal", "xpra.client.terminal.subsystem",
     "xpra.client.win32", "xpra.client.win32.subsystem",
     "xpra.clipboard", "xpra.codecs", "xpra.codecs.dmabuf", "xpra.codecs.pillow",
     "xpra.codecs.pillow.decoder", "xpra.codecs.pillow.encoder", "xpra.codecs.remote",
