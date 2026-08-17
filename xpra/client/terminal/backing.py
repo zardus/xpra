@@ -83,22 +83,27 @@ def to_rgba(rgb_format: str, data, width: int, height: int, rowstride: int) -> b
     needed = rowstride * (height - 1) + stride
     if len(src) < needed:
         raise ValueError(f"not enough pixel data: {len(src)} bytes, expected {needed}")
+    # work on `bytes` from here on: assigning a memoryview to a slice of a
+    # bytearray trips the type guards of a `cythonize_more` build:
     if rowstride != stride:
+        raw = src.tobytes()
         tight = bytearray(stride * height)
         for row in range(height):
-            tight[row * stride:(row + 1) * stride] = src[row * rowstride:row * rowstride + stride]
-        src = memoryview(tight)
+            tight[row * stride:(row + 1) * stride] = raw[row * rowstride:row * rowstride + stride]
+        flat = bytes(tight)
     else:
-        src = src[:stride * height]
+        flat = src[:stride * height].tobytes()
     if rgb_format == "RGBA":
-        return bytes(src)
+        return flat
     pixels = width * height
-    out = bytearray(pixels * BPP)
-    out[0::BPP] = src[rgb_format.index("R")::bpp]
-    out[1::BPP] = src[rgb_format.index("G")::bpp]
-    out[2::BPP] = src[rgb_format.index("B")::bpp]
+    # `object`, not `bytearray`: Cython's optimized bytearray slice assignment
+    # only accepts a bytearray right-hand side under a `cythonize_more` build:
+    out: object = bytearray(pixels * BPP)
+    out[0::BPP] = flat[rgb_format.index("R")::bpp]
+    out[1::BPP] = flat[rgb_format.index("G")::bpp]
+    out[2::BPP] = flat[rgb_format.index("B")::bpp]
     if "A" in rgb_format:
-        out[3::BPP] = src[rgb_format.index("A")::bpp]
+        out[3::BPP] = flat[rgb_format.index("A")::bpp]
     else:
         out[3::BPP] = b"\xff" * pixels
     return bytes(out)
