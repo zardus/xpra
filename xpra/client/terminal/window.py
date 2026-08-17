@@ -274,6 +274,12 @@ class ClientWindow(ClientWindowBase):
         self._window_state = {}
         log("map-window wid=%#x, geometry=%s, client properties=%s", self.wid, (x, y, w, h), props)
         self.send(WINDOW_MAP, self.wid, x, y, w, h, props, state)
+        # the client may only give a window the focus once the server has seen it
+        # mapped: focusing an unmapped window is a `BadMatch` the server swallows,
+        # which leaves the X input focus on `PointerRoot`:
+        mapped = getattr(self._client, "window_mapped", None)
+        if callable(mapped):
+            mapped(self)
 
     def hide(self) -> None:
         if not self._mapped:

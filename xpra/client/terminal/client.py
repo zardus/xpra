@@ -615,12 +615,21 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
                 self._or_stack.append(wid)
         elif wid not in self._stack:
             self._stack.append(wid)
-            # a freshly created regular window takes the focus if nothing has it,
-            # otherwise the keyboard would be dead until the user clicks:
-            if not self._focused:
-                self.focus_window(wid)
         log("_new_window(%s) stack=%s, override-redirect=%s", window, self._stack, self._or_stack)
         self.update_zorder()
+
+    def window_mapped(self, window) -> None:
+        """
+        Called by the window right after it sends `map-window`.
+        A freshly mapped regular window takes the focus if nothing has it,
+        otherwise the keyboard would be dead until the user clicks.
+        The focus MUST NOT be sent before the map: the server processes the
+        packets in order, and focusing a window it has not seen mapped yet is
+        a `BadMatch` it silently swallows, leaving the X input focus on
+        `PointerRoot` - key events are then routed by pointer position.
+        """
+        if not self._focused and not window.is_OR():
+            self.focus_window(window.wid)
 
     def forget_window(self, wid: int) -> None:
         if wid in self._stack:

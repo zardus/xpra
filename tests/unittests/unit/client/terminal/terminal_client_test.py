@@ -525,6 +525,8 @@ class TerminalClientTest(unittest.TestCase):
         window = FakeWindow(wid, pos, size, override_redirect)
         window_sub.windows[wid] = window
         client._new_window(None, window)
+        # a real `ClientWindow` calls this right after sending `map-window`:
+        client.window_mapped(window)
         return window
 
     def test_input_flush_is_only_armed_for_a_lone_byte(self):
