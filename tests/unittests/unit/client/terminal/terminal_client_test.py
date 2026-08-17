@@ -527,6 +527,66 @@ class TerminalClientTest(unittest.TestCase):
         client._new_window(None, window)
         return window
 
+    def test_input_flush_is_only_armed_for_a_lone_byte(self):
+        # a stalled multi-byte sequence must be waited for, not flushed:
+        # flushing it drops the key and mistypes its remainder as garbage
+        # (this is what broke fast typing over a congested link):
+        client, _ = self.make_input_client()
+        client.input_parser.feed(b"\x1b[")
+        client.schedule_input_flush()
+        self.assertEqual(client.input_flush_timer, 0)
+        # the sequence completes and parses as one event, nothing was lost:
+        events = client.input_parser.feed(b"97u")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].code, ord("a"))
+        # a lone `ESC` is the one case the timer is for:
+        client.input_parser.feed(b"\x1b")
+        client.schedule_input_flush()
+        self.assertNotEqual(client.input_flush_timer, 0)
+        client.source_remove(client.input_flush_timer)
+        client.input_flush_timer = 0
+
+    def test_input_flush_does_nothing_for_a_partial_sequence(self):
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        client.input_parser.feed(b"\x1b[9")
+        client.flush_terminal_input()
+        self.assertEqual(kb.actions, [])
+        self.assertEqual(client.input_parser.pending, 3)
+
+    def test_input_flush_converts_a_lone_escape(self):
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        # the client samples `terminal_fd` from stdin at construction time,
+        # and the test runner's stdin must not decide whether the flush runs:
+        client.terminal_fd = -1
+        client.input_parser.feed(b"\x1b")
+        client.flush_terminal_input()
+        # legacy mode synthesizes the release, so press + release:
+        self.assertEqual([(a[1], a[2]) for a in kb.actions], [("Escape", True), ("Escape", False)])
+        self.assertEqual(client.input_parser.pending, 0)
+
+    def test_input_flush_defers_to_pending_terminal_input(self):
+        # when the rest of the sequence is already waiting on the fd,
+        # the timer must not flush the `ESC` out from under it:
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        rfd, wfd = os.pipe()
+        try:
+            client.terminal_fd = rfd
+            os.write(wfd, b"[97u")
+            client.input_parser.feed(b"\x1b")
+            client.flush_terminal_input()
+            self.assertEqual(kb.actions, [])
+            self.assertEqual(client.input_parser.pending, 1)
+        finally:
+            client.terminal_fd = -1
+            os.close(rfd)
+            os.close(wfd)
+
     def test_key_events_go_to_the_focused_window(self):
         client, window_sub = self.make_input_client()
         kb = client.subsystems["keyboard"]

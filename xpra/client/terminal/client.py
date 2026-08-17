@@ -5,6 +5,7 @@
 
 import os
 import sys
+import select
 import signal
 import logging
 from typing import Any, Final
@@ -459,15 +460,27 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     def schedule_input_flush(self) -> None:
         # a terminal without the kitty keyboard protocol sends a bare `ESC` for the
         # Escape key, which is indistinguishable from the start of an escape sequence:
-        # drain the parser if nothing else arrives shortly after
+        # drain the parser if nothing else arrives shortly after.
+        # Only ever a single buffered byte: a stalled multi-byte sequence just means a
+        # slow terminal or congested link and the rest of it must be waited for -
+        # flushing it would drop the key and mistype its remainder as garbage:
         if self.input_flush_timer:
             self.source_remove(self.input_flush_timer)
             self.input_flush_timer = 0
-        if self.input_parser.pending:
+        if self.input_parser.pending == 1:
             self.input_flush_timer = self.timeout_add(INPUT_FLUSH_DELAY, self.flush_terminal_input)
 
     def flush_terminal_input(self) -> bool:
         self.input_flush_timer = 0
+        if self.input_parser.pending != 1:
+            return False
+        # if more input is already waiting on the fd, the rest of the sequence has
+        # arrived and the io watch is about to deliver it - do not flush a real
+        # escape sequence's `ESC` just because this timer was dispatched first:
+        if self.terminal_fd >= 0:
+            readable, _, _ = select.select([self.terminal_fd], [], [], 0)
+            if readable:
+                return False
         self.process_input_events(self.input_parser.flush())
         return False
 
