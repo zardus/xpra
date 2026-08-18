@@ -257,6 +257,7 @@ class ClientWindow(ClientWindowBase):
             self.send_client_properties()
         else:
             self.send_map()
+            self.fit_to_terminal()
         output = self.terminal_output()
         if output is not None:
             self.transmit_image(output)
@@ -307,6 +308,31 @@ class ClientWindow(ClientWindowBase):
 
     ######################################################################
     # geometry
+
+    def is_desktop(self) -> bool:
+        """ whether this window is a whole remote display (`xpra start-desktop`) """
+        return self._metadata.boolget("desktop", False)
+
+    def fit_to_terminal(self) -> None:
+        """
+        A desktop window is the whole remote display: ask the server to resize
+        the display to match the terminal (`--resize-display` permitting) - a
+        terminal cannot scroll or scale the window, anything beyond the
+        terminal area would be invisible.
+        The window itself is only resized when the server sends back the new
+        geometry, so a server which cannot resize its display changes nothing.
+        """
+        if not self.is_desktop():
+            return
+        width, height = self.terminal_pixel_size()
+        if width <= 0 or height <= 0 or (width, height) == tuple(self._size):
+            return
+        geomlog("fit_to_terminal() window %#x: asking for %s, showing %s",
+                self.wid, (width, height), self._size)
+        self.send(WINDOW_CONFIGURE, self.wid, {
+            "geometry": (0, 0, width, height),
+            "resize-counter": self._resize_counter,
+        })
 
     def move_resize(self, x: int, y: int, w: int, h: int, resize_counter: int = 0) -> None:
         w = max(1, w)

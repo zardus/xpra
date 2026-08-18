@@ -537,6 +537,39 @@ class TerminalWindowTest(unittest.TestCase):
         packet = client.last_packet(WINDOW_CONFIGURE)
         self.assertEqual(packet[2]["geometry"], (20, 40, 64, 32))
 
+    def test_desktop_windows_ask_to_be_resized_to_the_terminal(self):
+        # a desktop window (`xpra start-desktop`) is the whole remote display,
+        # showing it must ask the server to resize the display to the terminal:
+        client, window = self.make_window(geom=(0, 0, 8192, 4096), metadata={"desktop": True})
+        self.assertTrue(window.is_desktop())
+        window.show_all()
+        packet = client.last_packet(WINDOW_CONFIGURE)
+        self.assertEqual(packet[2]["geometry"], (0, 0, 800, 480))
+        # the request must not touch the window itself,
+        # only the geometry the server sends back may do that:
+        self.assertEqual(window._size, (8192, 4096))
+        # once the sizes match, showing again sends no new request:
+        client.packets = []
+        window.fit_to_terminal()
+        self.assertEqual(packet[2]["geometry"], (0, 0, 800, 480))
+        window.move_resize(0, 0, 800, 480)
+        client.packets = []
+        window.fit_to_terminal()
+        self.assertEqual(client.packet_types(), [])
+
+    def test_regular_windows_do_not_fit_to_the_terminal(self):
+        client, window = self.make_window()
+        window.show_all()
+        client.packets = []
+        window.fit_to_terminal()
+        self.assertEqual(client.packet_types(), [])
+
+    def test_desktop_windows_without_a_terminal_size_are_left_alone(self):
+        client = FakeClient(pixel_size=(0, 0))
+        client, window = self.make_window(client, geom=(0, 0, 8192, 4096), metadata={"desktop": True})
+        window.show_all()
+        self.assertNotIn(WINDOW_CONFIGURE, client.packet_types())
+
     ######################################################################
     # stacking and focus
 

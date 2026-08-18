@@ -356,6 +356,16 @@ class TerminalClientTest(unittest.TestCase):
             ui_client_base.UIXpraClient.init = saved
         self.assertEqual(seen, [False], "keyboard sync was still enabled when the subsystems were initialized")
 
+    def test_desktop_metadata_is_requested(self):
+        # the server only sends the window metadata a client declares support
+        # for, and the default list does not include the "desktop" flag which
+        # marks the whole-display windows of `start-desktop` sessions
+        # (`fit_to_terminal` resizes those to track the terminal):
+        client = self.make_client()
+        supported = client.hello_extra.get("metadata.supported", ())
+        self.assertIn("desktop", supported)
+        self.assertIn("title", supported)
+
     def test_tray_windows_are_ignored(self):
         client = self.make_client()
         window_sub = client.get_subsystem("window")

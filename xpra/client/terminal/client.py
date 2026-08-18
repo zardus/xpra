@@ -12,6 +12,7 @@ from typing import Any, Final
 from collections.abc import Sequence
 
 from xpra.os_util import gi_import
+from xpra.constants import DEFAULT_METADATA_SUPPORTED
 from xpra.exit_codes import ExitCode, ExitValue
 from xpra.platform.paths import get_default_log_dirs
 from xpra.util.env import envint, envbool, osexpand
@@ -169,6 +170,11 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         UIXpraClient.__init__(self)
         # `client_type` is reset by both `__init__` calls above, so set it last:
         self.client_type = "terminal"
+        # the server only sends the window metadata listed here, and the
+        # default list does not include the "desktop" flag which marks the
+        # whole-display windows of `start-desktop` sessions (`fit_to_terminal`
+        # resizes those to track the terminal):
+        self.hello_extra["metadata.supported"] = DEFAULT_METADATA_SUPPORTED + ("desktop", )
         # terminal state (nothing is touched until `start_terminal_mode`):
         self.terminal_fd: int = -1
         self.terminal_output: TerminalOutput | None = None
@@ -532,6 +538,12 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             self.query_terminal_size()
         if display := self.get_subsystem("display"):
             display.screen_size_changed()
+        # desktop windows are whole remote displays and track the terminal size:
+        if window_sub := self.get_subsystem("window"):
+            for wid in self.stacking_order():
+                window = window_sub.get_window(wid)
+                if window is not None:
+                    window.fit_to_terminal()
 
     def query_terminal_size(self) -> None:
         """ ask the terminal for its pixel geometry - the answers arrive as `TextReport` events """
