@@ -3,6 +3,7 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+import os
 import fcntl
 import struct
 import termios
@@ -10,7 +11,7 @@ import threading
 from typing import Final
 from collections.abc import Sequence
 
-from xpra.util.env import envbool, envint
+from xpra.util.env import envbool, envint, osexpand
 from xpra.log import Logger
 
 log = Logger("client", "terminal")
@@ -18,6 +19,9 @@ log = Logger("client", "terminal")
 # all terminal writes must happen on the GLib main loop thread,
 # enable this to find the ones that do not:
 THREAD_CHECK: Final[bool] = envbool("XPRA_TERMINAL_THREAD_CHECK", False)
+# flight recorder: append a copy of every byte written to the terminal to this file,
+# so a corrupted session can be diagnosed - and replayed - offline:
+CAPTURE_FILE: Final[str] = os.environ.get("XPRA_TERMINAL_CAPTURE", "")
 # kitty keyboard protocol flags: 1=disambiguate, 2=report event types,
 # 4=report alternate keys, 8=report all keys as escape codes, 16=report associated text.
 # 16 is what tells us that shift+`a` produced `A` rather than `a`, and 4 is the fallback
@@ -114,11 +118,18 @@ class TerminalOutput:
     The single writer to the terminal.
     The file object is injected so that tests can capture the bytes we emit.
     """
-    __slots__ = ("fileobj", "failed")
+    __slots__ = ("fileobj", "failed", "capture")
 
     def __init__(self, fileobj):
         self.fileobj = fileobj
         self.failed = False
+        self.capture = None
+        if CAPTURE_FILE:
+            try:
+                self.capture = open(osexpand(CAPTURE_FILE), "ab")
+            except OSError as e:
+                log.warn("Warning: cannot open capture file %r", CAPTURE_FILE)
+                log.warn(f" {e}")
 
     def __repr__(self):
         return f"TerminalOutput({self.fileobj})"
@@ -135,6 +146,11 @@ class TerminalOutput:
         if self.failed or not data:
             return
         self.check_thread()
+        if self.capture is not None:
+            try:
+                self.capture.write(data)
+            except (OSError, ValueError):
+                self.capture = None
         try:
             self.fileobj.write(data)
         except (OSError, ValueError) as e:
@@ -147,6 +163,11 @@ class TerminalOutput:
         if self.failed:
             return
         self.check_thread()
+        if self.capture is not None:
+            try:
+                self.capture.flush()
+            except (OSError, ValueError):
+                self.capture = None
         try:
             self.fileobj.flush()
         except (OSError, ValueError) as e:

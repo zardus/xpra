@@ -11,6 +11,8 @@ import termios
 import unittest
 from io import BytesIO
 
+from xpra.util.env import OSEnvContext
+
 from unit.test_util import silence_error
 
 try:
@@ -330,6 +332,28 @@ class TestCellSizeFromReport(unittest.TestCase):
         self.assertEqual(len(events), 1)
         report = events[0]
         self.assertEqual(tty_module.cell_size_from_report(report.kind, report.values), (10, 20))
+
+
+@unittest.skipIf(tty_module is None, "the terminal client tty module is not available")
+class TestCaptureTee(unittest.TestCase):
+
+    def test_capture_records_every_byte(self):
+        import importlib
+        import tempfile
+        from xpra.client.terminal import tty as tty_module
+        cap = tempfile.mktemp()
+        with OSEnvContext(XPRA_TERMINAL_CAPTURE=cap):
+            importlib.reload(tty_module)
+            try:
+                buf = BytesIO()
+                out = tty_module.TerminalOutput(buf)  # noqa: F821
+                out.write(b"\x1b_Ga=t;AAAA\x1b\\")
+                out.write(b"plain")
+                out.flush()
+                self.assertEqual(open(cap, "rb").read(), buf.getvalue())
+            finally:
+                os.unlink(cap)
+        importlib.reload(tty_module)
 
 
 def main():
