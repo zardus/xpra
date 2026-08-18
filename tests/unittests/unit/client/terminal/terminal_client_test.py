@@ -433,7 +433,28 @@ class TerminalClientTest(unittest.TestCase):
     ######################################################################
     # the kitty graphics protocol probe
 
+    def test_full_retransmits_are_the_default(self):
+        # frame edits have proven unreliable on some terminals (kitty on Wayland),
+        # so out of the box every update re-sends the whole image:
+        client = self.make_client()
+        buf = self.make_output(client)
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
+        self.assertTrue(client.graphics_ok)
+        self.assertFalse(client.frame_probe_sent)
+        self.assertFalse(client.frame_edits)
+        # no frame edit probe went out, the test image is freed straight away:
+        data = buf.getvalue()
+        self.assertNotIn(b"a=f", data)
+        self.assertIn(b"a=d,d=I", data)
+
+    def _force_frame_edit_probe(self):
+        saved = terminal_client.FRAME_EDITS
+        terminal_client.FRAME_EDITS = -1
+        self.addCleanup(setattr, terminal_client, "FRAME_EDITS", saved)
+
     def test_graphics_probe_accepted(self):
+        # the auto-detection probe is no longer the default, turn it back on:
+        self._force_frame_edit_probe()
         client = self.make_client()
         buf = self.make_output(client)
         window_sub = FakeWindowSubsystem()
@@ -459,6 +480,8 @@ class TerminalClientTest(unittest.TestCase):
         self.assertIn(b"a=d,d=I", buf.getvalue())
 
     def test_frame_edits_rejected(self):
+        # the auto-detection probe is no longer the default, turn it back on:
+        self._force_frame_edit_probe()
         client = self.make_client()
         buf = self.make_output(client)
         probe_id = terminal_client.PROBE_IMAGE_ID
@@ -471,6 +494,8 @@ class TerminalClientTest(unittest.TestCase):
         self.assertIn(b"a=d,d=I", buf.getvalue())
 
     def test_frame_edit_probe_timeout(self):
+        # the auto-detection probe is no longer the default, turn it back on:
+        self._force_frame_edit_probe()
         client = self.make_client()
         self.make_output(client)
         probe_id = terminal_client.PROBE_IMAGE_ID

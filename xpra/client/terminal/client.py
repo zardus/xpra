@@ -65,10 +65,12 @@ SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
 # in milliseconds - it repairs server-side damage tracking holes under rapid typing.
 # 0 disables it:
 TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 750)
-# `a=f` frame edits are how damaged regions are updated without re-sending the
-# whole image, but not every terminal implementing the graphics protocol has them
-# (kitty does, Ghostty does not): -1 = detect with a probe, 0 = never, 1 = always:
-FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", -1)
+# `a=f` frame edits update damaged regions without re-sending the whole image,
+# but their rendering has proven unreliable on some terminal/display combinations
+# (observed: kitty on Wayland dropping edits under rapid updates, while the same
+# kitty version on X11 renders them correctly), so full retransmits are the
+# default: -1 = detect support with a probe and use them, 0 = never, 1 = always:
+FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", 0)
 # how long to wait for the terminal to answer the frame edit probe, in milliseconds:
 FRAME_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_FRAME_PROBE_TIMEOUT", 1000)
 
