@@ -7,18 +7,25 @@ import os
 import fcntl
 import struct
 import termios
-import threading
 from typing import Final
 from collections.abc import Sequence
 
-from xpra.util.env import envbool, envint, osexpand
+from xpra.util.env import envint, osexpand
+from xpra.util.thread import check_main_thread
 from xpra.log import Logger
 
 log = Logger("client", "terminal")
 
-# all terminal writes must happen on the GLib main loop thread,
-# enable this to find the ones that do not:
-THREAD_CHECK: Final[bool] = envbool("XPRA_TERMINAL_THREAD_CHECK", False)
+# the terminal geometry to assume when the terminal does not report one
+# (`get_root_size()` is called long before we can query the real terminal):
+DEFAULT_COLUMNS: Final[int] = 80
+DEFAULT_ROWS: Final[int] = 24
+# the cell size to assume when the terminal does not report its pixel size,
+# and before the client has measured it:
+DEFAULT_CELL_WIDTH: Final[int] = envint("XPRA_TERMINAL_CELL_WIDTH", 10)
+DEFAULT_CELL_HEIGHT: Final[int] = envint("XPRA_TERMINAL_CELL_HEIGHT", 20)
+# terminals are not physical screens, assume the usual 96 DPI:
+DPI: Final[int] = envint("XPRA_TERMINAL_DPI", 96)
 # flight recorder: append a copy of every byte written to the terminal to this file,
 # so a corrupted session can be diagnosed - and replayed - offline:
 CAPTURE_FILE: Final[str] = os.environ.get("XPRA_TERMINAL_CAPTURE", "")
@@ -134,18 +141,11 @@ class TerminalOutput:
     def __repr__(self):
         return f"TerminalOutput({self.fileobj})"
 
-    def check_thread(self) -> None:
-        if not THREAD_CHECK:
-            return
-        current = threading.current_thread()
-        if current is not threading.main_thread():
-            log.error("Error: terminal output used from thread %r", current.name)
-            log.error(" all terminal writes must happen on the UI thread")
-
     def write(self, data: bytes) -> None:
         if self.failed or not data:
             return
-        self.check_thread()
+        # all terminal writes must happen on the UI thread:
+        check_main_thread()
         if self.capture is not None:
             try:
                 self.capture.write(data)
@@ -162,7 +162,7 @@ class TerminalOutput:
                 if written is None or written >= len(view):
                     break
                 if written <= 0:
-                    raise OSError("terminal write returned %r" % (written, ))
+                    raise OSError(f"terminal write returned {written!r}")
                 view = view[written:]
         except (OSError, ValueError) as e:
             self.failed = True
@@ -173,7 +173,7 @@ class TerminalOutput:
     def flush(self) -> None:
         if self.failed:
             return
-        self.check_thread()
+        check_main_thread()
         if self.capture is not None:
             try:
                 self.capture.flush()

@@ -4,6 +4,7 @@
 # later version. See the file COPYING for details.
 
 from typing import Final
+from dataclasses import dataclass
 from collections.abc import Sequence
 
 from xpra.util.env import envint
@@ -118,89 +119,46 @@ SGR_MODIFIERS: Final[dict[int, int]] = {
 NEED_MORE: Final[int] = 0
 
 
+@dataclass(slots=True)
 class KeyEvent:
     """ a key as reported by the terminal, before any keysym translation """
-    __slots__ = ("code", "shifted", "base", "mods", "event_type", "text")
-
-    def __init__(self, code: int = 0, shifted: int = 0, base: int = 0,
-                 mods: int = 0, event_type: int = KEY_PRESS, text: str = ""):
-        self.code = code
-        self.shifted = shifted
-        self.base = base
-        self.mods = mods
-        self.event_type = event_type
-        self.text = text
-
-    def __repr__(self):
-        return (f"KeyEvent(code={self.code}, shifted={self.shifted}, base={self.base},"
-                f" mods={self.mods}, event_type={self.event_type}, text={self.text!r})")
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, KeyEvent) and repr(self) == repr(other)
+    code: int = 0
+    shifted: int = 0
+    base: int = 0
+    mods: int = 0
+    event_type: int = KEY_PRESS
+    text: str = ""
 
 
+@dataclass(slots=True)
 class MouseEvent:
     """ a pointer event decoded from an SGR (1006 / 1016) mouse report """
-    __slots__ = ("x", "y", "button", "event", "mods")
-
-    def __init__(self, x: int = 0, y: int = 0, button: int = 0, event: str = "", mods: int = 0):
-        self.x = x
-        self.y = y
-        self.button = button
-        self.event = event
-        self.mods = mods
-
-    def __repr__(self):
-        return (f"MouseEvent(x={self.x}, y={self.y}, button={self.button},"
-                f" event={self.event!r}, mods={self.mods})")
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, MouseEvent) and repr(self) == repr(other)
+    x: int = 0
+    y: int = 0
+    button: int = 0
+    event: str = ""
+    mods: int = 0
 
 
+@dataclass(slots=True)
 class GraphicsResponse:
     """ the terminal's answer to a kitty graphics command: `ESC _ G i=<id>;OK ESC \\` """
-    __slots__ = ("image_id", "ok", "message")
-
-    def __init__(self, image_id: int = 0, ok: bool = False, message: str = ""):
-        self.image_id = image_id
-        self.ok = ok
-        self.message = message
-
-    def __repr__(self):
-        return f"GraphicsResponse(image_id={self.image_id}, ok={self.ok}, message={self.message!r})"
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, GraphicsResponse) and repr(self) == repr(other)
+    image_id: int = 0
+    ok: bool = False
+    message: str = ""
 
 
+@dataclass(slots=True)
 class KeyboardFlagsResponse:
     """ the terminal's answer to `CSI ? u`: the keyboard protocol flags currently in effect """
-    __slots__ = ("flags", )
-
-    def __init__(self, flags: int = 0):
-        self.flags = flags
-
-    def __repr__(self):
-        return f"KeyboardFlagsResponse(flags={self.flags})"
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, KeyboardFlagsResponse) and repr(self) == repr(other)
+    flags: int = 0
 
 
+@dataclass(slots=True)
 class TextReport:
     """ a `CSI <kind> ; <values...> t` window report, ie kind 4 = text area size in pixels """
-    __slots__ = ("kind", "values")
-
-    def __init__(self, kind: int = 0, values: Sequence[int] = ()):
-        self.kind = kind
-        self.values = tuple(values)
-
-    def __repr__(self):
-        return f"TextReport(kind={self.kind}, values={self.values})"
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, TextReport) and repr(self) == repr(other)
+    kind: int = 0
+    values: tuple[int, ...] = ()
 
 
 def utf8_length(first: int) -> int:

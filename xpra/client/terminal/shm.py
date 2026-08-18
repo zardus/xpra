@@ -4,6 +4,7 @@
 # later version. See the file COPYING for details.
 
 import os
+from typing import Final
 
 from xpra.log import Logger
 
@@ -13,7 +14,7 @@ log = Logger("client", "terminal")
 # `open` under this directory): the terminal opens our objects by name,
 # so this only works when the terminal runs on this machine - which is
 # what the `t=s` probe verifies before any of this is used:
-SHM_DIR = "/dev/shm"
+SHM_DIR: Final[str] = "/dev/shm"
 
 
 class ShmWriter:

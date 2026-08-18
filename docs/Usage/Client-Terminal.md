@@ -68,8 +68,8 @@ testing needs.
 to the terminal's clipboard, and the client never claims the selection itself. Whether the
 terminal accepts it is the terminal's decision - kitty, for instance, requires
 `clipboard_control` to list `write-clipboard`. Pasting into the remote session is not
-supported, because reading the clipboard back over `OSC 52` is disabled by default in every
-terminal that implements it.
+supported, because reading the clipboard back over `OSC 52` is disabled or gated behind a
+user prompt by default in every terminal that implements it.
 
 <div class="docs-section-heading" markdown="1">
 
@@ -84,9 +84,9 @@ terminal that implements it.
 * the mouse cursor is painted by the client as one more image on top of the windows
 * keyboard layout handling is minimal: the terminal reports characters, not keycodes, so
   server side keymaps are not synchronised
-* terminals which implement the graphics protocol without animation frame edits
-  (ie: Ghostty) get every damaged window re-sent whole instead of patched;
-  the client probes for this at startup, `XPRA_TERMINAL_FRAME_EDITS=0|1` overrides it
+* damaged windows are re-sent whole by default, or patched through shared memory
+  when the terminal runs on the same machine and answers the startup probe;
+  `XPRA_TERMINAL_FRAME_EDITS=-1` probes for direct frame edits instead, `1` forces them
 * the pixel coordinate base of SGR mouse reports varies between terminals:
   the client assumes `0` under kitty and `1` everywhere else,
   `XPRA_TERMINAL_MOUSE_COORDINATE_BASE=0|1` overrides it

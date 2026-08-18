@@ -25,6 +25,7 @@ from xpra.client.terminal import graphics
 from xpra.client.terminal.tty import (
     TerminalOutput, TerminalContext,
     get_terminal_size, cell_size_from_report, SIZE_QUERIES,
+    DEFAULT_COLUMNS, DEFAULT_ROWS, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT, DPI,
 )
 from xpra.client.terminal.input import (
     InputParser, KeyEvent, MouseEvent, GraphicsResponse, KeyboardFlagsResponse, TextReport,
@@ -33,7 +34,7 @@ from xpra.client.terminal.input import (
 from xpra.client.terminal.keys import make_key_event, modifier_names, MODIFIER_CODE_BITS
 from xpra.client.terminal.backing import to_rgba
 from xpra.client.terminal.shm import ShmWriter
-from xpra.client.terminal.window import cell_position, BACK_IMAGE_OFFSET, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
+from xpra.client.terminal.window import ClientWindow, cell_position, BACK_IMAGE_OFFSET
 from xpra.log import Logger, setloghandler
 
 log = Logger("client", "terminal")
@@ -44,12 +45,6 @@ cursorlog = Logger("cursor", "terminal")
 GLib = gi_import("GLib")
 GObject = gi_import("GObject")
 
-# the terminal geometry to assume when the terminal does not report one
-# (`get_root_size()` is called long before we can query the real terminal):
-DEFAULT_COLUMNS: Final[int] = 80
-DEFAULT_ROWS: Final[int] = 24
-# terminals are not physical screens, assume the usual 96 DPI:
-DPI: Final[int] = envint("XPRA_TERMINAL_DPI", 96)
 # how long we wait for the terminal to answer our kitty graphics query, in milliseconds:
 PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_PROBE_TIMEOUT", 2000)
 # quit when the terminal does not answer the graphics query - turn this off to
@@ -64,9 +59,10 @@ INPUT_FLUSH_DELAY: Final[int] = envint("XPRA_TERMINAL_INPUT_FLUSH_DELAY", 50)
 # (one without pixel dimensions after a reading which had them), in milliseconds:
 SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
 # ask the server to refresh the focused window this long after the last key press,
-# in milliseconds - it repairs server-side damage tracking holes under rapid typing.
-# 0 disables it:
-TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 750)
+# in milliseconds: paints for small damage regions can arrive late under rapid
+# typing on some servers, and one refresh per typing burst repairs the window.
+# 0 (the default) disables it:
+TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 0)
 # `a=f` frame edits update damaged regions without re-sending the whole image,
 # but kitty (0.45) drops chunked frame edits which directly follow another
 # chunked graphics command: the edit is accepted without an error response and
@@ -267,10 +263,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     # lifecycle
 
     def init(self, opts) -> None:
-        # there is nowhere to put a system tray icon in a terminal
-        # (`get_system_tray_classes()` returns nothing), so the tray forwarding
-        # must not be advertised to the server - it would send us tray windows
-        # we have no way of creating:
+        # see the `--backend=terminal` block in `xpra/scripts/main.py`:
         opts.system_tray = False
         # the keyboard must be client-managed: with sync enabled the server
         # holds each key down between our press and release packets, and the
@@ -742,12 +735,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
 
     def schedule_type_refresh(self) -> None:
         """
-        Ask the server to refresh the focused window once a typing burst settles.
-        The server's damage tracking has been observed missing or delaying small
-        updates under rapid typing (glyphs vanishing at line-wrap boundaries,
-        whole bursts arriving minutes late): one refresh per burst repairs any
-        hole and resets a wedged batch, at the cost of a single full-window
-        update per pause.
+        Ask the server to refresh the focused window once a typing burst settles
+        (see `TYPE_REFRESH_DELAY`): paints for small damage regions can arrive
+        late under rapid typing on some servers, and one refresh per burst
+        repairs the window at the cost of a single full-window update per pause.
         """
         if TYPE_REFRESH_DELAY <= 0:
             return
@@ -759,10 +750,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.type_refresh_timer = 0
         wid = self._focused
         if wid and (window_sub := self.get_subsystem("window")):
-            send_refresh = getattr(window_sub, "send_refresh", None)
-            if callable(send_refresh):
-                keylog("type_refresh() refreshing window %#x", wid)
-                send_refresh(wid)
+            keylog("type_refresh() refreshing window %#x", wid)
+            window_sub.send_refresh(wid)
         return False
 
     def get_current_modifiers(self) -> Sequence[str]:
@@ -841,15 +830,14 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     ######################################################################
     # window manager state: stacking order, z indexes and focus
 
-    def get_window(self, wid: int):
+    def get_window(self, wid: int) -> ClientWindow | None:
         window = self.get_subsystem("window")
         return window.get_window(wid) if window else None
 
     def _new_window(self, _emitter, window) -> None:
         wid = window.wid
         if window.is_OR():
-            metadata = getattr(window, "_metadata", typedict())
-            parent = metadata.intget("parent", 0) or getattr(window, "_transient_for", 0)
+            parent = window._metadata.intget("parent", 0) or window._transient_for
             self._or_parent[wid] = parent
             if wid not in self._or_stack:
                 self._or_stack.append(wid)
@@ -980,12 +968,11 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     def may_sync_pointer(self, wid: int) -> None:
         """
         Until the user actually touches the mouse, park the server's pointer inside
-        the focused window.  A GUI client's pointer is naturally over its windows,
-        but ours starts wherever the vfb put it - and when the server's
-        `XSetInputFocus` does not take effect, the X input focus stays on
-        `PointerRoot` and every key press is routed to the window under the
-        pointer: with the pointer outside every window, the keyboard is dead
-        until the first click.
+        the focused window.  A GUI client's pointer naturally hovers its windows,
+        but ours starts wherever the vfb put it - and with the X input focus on
+        `PointerRoot`, key presses are routed to the window under the pointer:
+        with the pointer outside every window, the keyboard is dead until the
+        first click.
         """
         if self._pointer_synced:
             return
@@ -1004,7 +991,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         """ the topmost mapped window containing this terminal pixel """
         for wid in reversed(self.stacking_order()):
             window = self.get_window(wid)
-            if window is None or not getattr(window, "_mapped", False):
+            if window is None or not window._mapped:
                 continue
             wx, wy = window._pos
             ww, wh = window._size
@@ -1202,7 +1189,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             self.shm_probe_timer = 0
             self.source_remove(st)
 
-    def shm_transfer(self, pixels) -> str:
+    def shm_transfer(self, pixels: bytes) -> str:
         """
         Store the pixels in a shared memory object for the terminal to read,
         returns the object name, or an empty string when shared memory is not
@@ -1305,7 +1292,6 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         return encoding.get_encodings() if encoding else ()
 
     def get_client_window_classes(self, _geom, _metadata, _override_redirect) -> Sequence[type]:
-        from xpra.client.terminal.window import ClientWindow
         # there is no OpenGL alternative to fall back from:
         return (ClientWindow, )
 

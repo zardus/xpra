@@ -7,14 +7,10 @@ from typing import Any, Final
 from collections.abc import Sequence
 
 from xpra.keyboard.mask import DEFAULT_MODIFIER_MEANINGS
-from xpra.platform import keyboard as platform_keyboard
 from xpra.platform.keyboard_base import KeyboardBase
 from xpra.client.gui.keyboard_helper import KeyboardHelper
 from xpra.client.terminal.input import SGR_MODIFIERS
 from xpra.client.terminal.keys import FUNCTIONAL_KEYSYMS, KITTY_MODIFIERS
-from xpra.log import Logger
-
-log = Logger("keyboard", "terminal")
 
 # the terminal tells us which key was pressed, not which keycode was used to press it,
 # so the server maps the key names we send: the layout below is just what it should load
@@ -86,19 +82,15 @@ class TerminalKeyboardHelper(KeyboardHelper):
     """
 
     def __init__(self, *args, **kwargs):
-        # `KeyboardHelper.__init__` instantiates the platform keyboard class,
-        # which queries the local X11 keymap and the GNOME input sources over dbus
-        # (and can end up importing Gdk): none of that applies to a terminal client.
-        # (upstream hook wanted: a `KeyboardHelper.make_keyboard()` factory to override)
-        platform_class = getattr(platform_keyboard, "Keyboard", None)
-        platform_keyboard.Keyboard = TerminalKeyboard
-        try:
-            super().__init__(*args, **kwargs)
-        finally:
-            platform_keyboard.Keyboard = platform_class
-        log("%s using %s instead of %s", self, self.keyboard, platform_class)
+        super().__init__(*args, **kwargs)
         # our keymap never changes, query it once so the hello capabilities have it:
         self.update()
+
+    def make_keyboard(self) -> TerminalKeyboard:
+        # the platform keyboard queries the local X11 keymap and the GNOME input
+        # sources over dbus (and can end up importing Gdk):
+        # none of that applies to a terminal client
+        return TerminalKeyboard()
 
     def __repr__(self):
         return "TerminalKeyboardHelper"

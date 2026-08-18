@@ -367,12 +367,6 @@ class KittyKeyboardParserTest(unittest.TestCase):
             events += parser.feed(data[split:])
             self.assertEqual(events, whole, f"mismatch when splitting at {split}")
 
-    def test_repr(self):
-        for data in (b"\x1b[97u", b"\x1b[<0;1;2M", b"\x1b_Gi=1;OK\x1b\\", b"\x1b[?1u", b"\x1b[4;1;2t"):
-            event = self.one(data)
-            self.assertTrue(repr(event))
-            self.assertNotEqual(event, None)
-
 
 @unittest.skipIf(terminal_keys is None, "the terminal client component is not built")
 class TerminalKeysTest(unittest.TestCase):

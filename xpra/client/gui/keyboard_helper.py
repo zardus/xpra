@@ -10,6 +10,7 @@ from typing import Any, TypeAlias
 from collections.abc import Callable, Sequence
 
 from xpra.keyboard.common import KeyEvent
+from xpra.platform.keyboard_base import KeyboardBase
 from xpra.client.gui.keyboard_shortcuts_parser import parse_shortcut_modifiers, parse_shortcuts, get_modifier_names
 from xpra.net.packet_type import KEYBOARD_CONFIG
 from xpra.util.str_fn import std, csv, Ellipsizer
@@ -73,14 +74,17 @@ class KeyboardHelper:
         self.layouts_option = layouts
         self.variants_option = variants
         self.options = options
-        # the platform class which allows us to map the keys:
-        from xpra.platform.keyboard import Keyboard  # pylint: disable=import-outside-toplevel
-        self.keyboard = Keyboard()  # pylint: disable=not-callable
+        self.keyboard = self.make_keyboard()
         log("KeyboardHelper(%s) keyboard=%s",
             (net_send, keyboard_sync, key_shortcuts,
              raw, model, layout, layouts, variant, variants, options), self.keyboard)
         if key_repeat := self.keyboard.get_keyboard_repeat():
             self.key_repeat_delay, self.key_repeat_interval = key_repeat
+
+    def make_keyboard(self) -> KeyboardBase:
+        # the platform class which allows us to map the keys:
+        from xpra.platform.keyboard import Keyboard  # pylint: disable=import-outside-toplevel
+        return Keyboard()  # pylint: disable=not-callable
 
     def set_platform_layout(self, layout: str) -> None:
         if hasattr(self.keyboard, "set_platform_layout"):
@@ -406,7 +410,6 @@ class KeyboardHelper:
                 "backend", "backend_name",
                 "layout", "layouts", "variant", "variants", "options",
                 "raw", "layout_groups",
-                "sync",
                 "query_struct", "mod_meanings",
                 "mod_managed", "mod_pointermissing", "keycodes", "x11_keycodes",
         ):
@@ -418,13 +421,12 @@ class KeyboardHelper:
                 v = getattr(self, f"{x}_option", "")
             if not v:
                 v = getattr(self, x)
-            if x == "sync":
-                # always include booleans: dropping a `False` here would make
-                # the server fall back to its default (which is `True`, so
-                # disabling the keyboard sync would be impossible):
-                props[x] = bool(v)
-            elif v:
+            if v:
                 props[x] = v
+        if "sync" not in skip:
+            # the server defaults `sync` to `True` (`boolget`),
+            # so a `False` value must always be sent explicitly:
+            props["sync"] = bool(self.sync)
         return props
 
     def log_keyboard_info(self) -> None:

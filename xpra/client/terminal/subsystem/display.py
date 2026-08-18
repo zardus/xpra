@@ -9,16 +9,13 @@ from collections.abc import Sequence
 from xpra.util.env import envint
 from xpra.util.parsing import DEFAULT_REFRESH_RATE
 from xpra.client.subsystem.display import DisplayClient
+from xpra.client.terminal.tty import DEFAULT_COLUMNS, DEFAULT_ROWS, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT, DPI
 from xpra.log import Logger
 
 log = Logger("screen", "terminal")
 
 # the terminal size we assume until the client can tell us the real one
 # (`get_root_size` is called before the client enters terminal mode):
-DEFAULT_COLUMNS: Final[int] = 80
-DEFAULT_ROWS: Final[int] = 24
-DEFAULT_CELL_WIDTH: Final[int] = 10
-DEFAULT_CELL_HEIGHT: Final[int] = 20
 DEFAULT_ROOT_SIZE: Final[tuple[int, int]] = (
     DEFAULT_COLUMNS * DEFAULT_CELL_WIDTH,
     DEFAULT_ROWS * DEFAULT_CELL_HEIGHT,
@@ -27,8 +24,6 @@ MONITOR_NAME: Final[str] = "terminal"
 # terminals don't have a refresh rate, this is the rate at which we are willing to repaint,
 # in milli-Hz (as in the `monitors` capability):
 REFRESH_RATE: Final[int] = envint("XPRA_TERMINAL_REFRESH_RATE", DEFAULT_REFRESH_RATE)
-# terminals don't have a physical size either, assume the usual 96 DPI:
-DPI: Final[int] = envint("XPRA_TERMINAL_DPI", 96)
 MM_PER_INCH: Final[float] = 25.4
 
 
@@ -52,16 +47,10 @@ class TerminalDisplayClient(DisplayClient):
 
     def get_root_size(self) -> tuple[int, int]:
         # this is called from `init` (via `parse_scaling`), long before the client
-        # switches the terminal to raw mode, so it must never fail:
-        size = ()
-        terminal_pixel_size = getattr(self.client, "terminal_pixel_size", None)
-        if callable(terminal_pixel_size):
-            size = terminal_pixel_size()
-        if size and len(size) >= 2:
-            w = int(size[0])
-            h = int(size[1])
-            if w > 0 and h > 0:
-                return w, h
+        # switches the terminal to raw mode:
+        w, h = self.client.terminal_pixel_size()
+        if w > 0 and h > 0:
+            return w, h
         log("get_root_size() no terminal size available from %s, using %s", self.client, DEFAULT_ROOT_SIZE)
         return DEFAULT_ROOT_SIZE
 

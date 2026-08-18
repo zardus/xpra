@@ -11,18 +11,9 @@ from xpra.client.gui.window.backing import (
     fire_paint_callbacks, clip_span,
 )
 from xpra.util.objects import typedict
-from xpra.util.env import envbool
 from xpra.log import Logger
 
 log = Logger("paint", "terminal")
-
-# merge overlapping damage rectangles into their bounding box,
-# turn this off to see exactly which rectangles were painted:
-MERGE_DAMAGE: bool = envbool("XPRA_TERMINAL_MERGE_DAMAGE", True)
-
-# preserve the window contents when the buffer is resized,
-# turn this off to see a resized window blank until the server repaints it:
-COPY_OLD_BACKING: bool = envbool("XPRA_TERMINAL_COPY_OLD_BACKING", True)
 
 # the terminal renders RGBA pixels, so this is the only pixel size we ever store:
 BPP: Final[int] = 4
@@ -53,16 +44,15 @@ def merge_rects(rects: Sequence[Sequence[int]]) -> list[tuple[int, int, int, int
         if w <= 0 or h <= 0:
             continue
         current = (x, y, w, h)
-        if MERGE_DAMAGE:
-            absorbed = True
-            while absorbed:
-                absorbed = False
-                for index, other in enumerate(merged):
-                    if rects_overlap(current, other):
-                        current = bounding_box(current, other)
-                        merged.pop(index)
-                        absorbed = True
-                        break
+        absorbed = True
+        while absorbed:
+            absorbed = False
+            for index, other in enumerate(merged):
+                if rects_overlap(current, other):
+                    current = bounding_box(current, other)
+                    merged.pop(index)
+                    absorbed = True
+                    break
         merged.append(current)
     return merged
 
@@ -156,7 +146,7 @@ class TerminalBacking(WindowBackingBase):
         until the server repaints it (this is what the cairo and OpenGL backings do).
         """
         bw, bh = self.size
-        if not COPY_OLD_BACKING or oldw <= 0 or oldh <= 0 or len(old_pixels) != oldw * oldh * BPP:
+        if oldw <= 0 or oldh <= 0 or len(old_pixels) != oldw * oldh * BPP:
             return
         sx, sy, dx, dy, w, h = self.gravity_copy_coords(oldw, oldh, bw, bh)
         log("copy_old_backing() %ix%i -> %ix%i, gravity=%s, copying %ix%i from %s to %s",

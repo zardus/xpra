@@ -17,6 +17,7 @@ import unittest
 import subprocess
 from io import BytesIO
 from base64 import b64decode
+from unittest.mock import patch
 from collections.abc import Sequence
 
 from xpra.exit_codes import ExitCode
@@ -25,6 +26,10 @@ from xpra.util.objects import typedict, AdHocStruct
 from xpra.client.base import client as base_client
 from xpra.client.gui import ui_client_base
 from unit.test_util import silence_info, silence_warn
+from unit.client.terminal.terminal_test_util import (
+    TERMINAL_SIZE,
+    FakeWindow, FakeWindowSubsystem, FakePointerSubsystem, FakeDisplaySubsystem, FakeKeyboardSubsystem,
+)
 
 try:
     from xpra.client.terminal import graphics
@@ -42,9 +47,6 @@ except ImportError:
     TerminalOutput = None
     KeyEvent = MouseEvent = GraphicsResponse = KeyboardFlagsResponse = TextReport = None
     TerminalDisplayClient = None
-
-# the terminal geometry these tests pretend to run in: (columns, rows, width, height)
-TERMINAL_SIZE = (100, 30, 1000, 600)
 
 # `GLib.IO_IN`, spelled out so that this test package never imports `gi`:
 IO_IN = 1
@@ -65,91 +67,6 @@ print("RESULT opengl=%s systray=%s progress=%s subsystems=,%s,"
 print("OPTIONS opengl=%r system_tray=%r splash=%r" % (opts.opengl, opts.system_tray, opts.splash))
 client.cleanup()
 """
-
-
-class FakeWindow:
-    """ the little of a `ClientWindow` that the client's input routing looks at """
-
-    def __init__(self, wid: int, pos=(0, 0), size=(100, 100), override_redirect=False):
-        self.wid = wid
-        self._pos = pos
-        self._size = size
-        self._mapped = True
-        self._metadata = typedict()
-        self._override_redirect = override_redirect
-        self.placements = 0
-
-    def is_OR(self) -> bool:
-        return self._override_redirect
-
-    def refresh_placement(self) -> None:
-        self.placements += 1
-
-
-class FakeWindowSubsystem:
-    """ replaces the composed `window` subsystem, recording what the client sends it """
-
-    def __init__(self):
-        # the real subsystem exposes the registry under this name:
-        self.windows: dict[int, FakeWindow] = {}
-        self._id_to_window = self.windows
-        self.focus_events: list[tuple] = []
-        self.buttons: list[tuple] = []
-        self.wheels: list[tuple] = []
-        self.refreshes: list[int] = []
-        self._window_with_grab = 0
-
-    def cleanup(self) -> None:
-        """ the client cleans up every subsystem """
-
-    def get_window(self, wid: int):
-        return self.windows.get(wid)
-
-    def update_focus(self, wid: int, gotit: bool) -> None:
-        self.focus_events.append((wid, gotit))
-
-    def send_refresh(self, wid: int) -> None:
-        self.refreshes.append(wid)
-
-    def send_button(self, device_id, wid, button, pressed, pointer, modifiers, buttons, props) -> None:
-        self.buttons.append((device_id, wid, button, pressed, pointer, tuple(modifiers), tuple(buttons)))
-
-    def wheel_event(self, device_id, wid, deltax, deltay, pointer) -> None:
-        self.wheels.append((device_id, wid, deltax, deltay, pointer))
-
-
-class FakePointerSubsystem:
-    def __init__(self):
-        self.positions: list[tuple] = []
-
-    def cleanup(self) -> None:
-        """ the client cleans up every subsystem """
-
-    def send_mouse_position(self, device_id, wid, pos, modifiers=None, buttons=None, props=None) -> None:
-        self.positions.append((device_id, wid, pos, tuple(modifiers or ()), tuple(buttons or ())))
-
-
-class FakeDisplaySubsystem:
-    def __init__(self):
-        self.screen_changes = 0
-
-    def cleanup(self) -> None:
-        """ the client cleans up every subsystem """
-
-    def screen_size_changed(self) -> None:
-        self.screen_changes += 1
-
-
-class FakeKeyboardSubsystem:
-    def __init__(self):
-        self.actions: list[tuple] = []
-
-    def cleanup(self) -> None:
-        """ the client cleans up every subsystem """
-
-    def handle_key_action(self, window, key_event) -> bool:
-        self.actions.append((window, key_event.keyname, key_event.pressed, tuple(key_event.modifiers)))
-        return False
 
 
 class FakeEncodingSubsystem:
@@ -252,7 +169,9 @@ class TerminalClientTest(unittest.TestCase):
                          (80 * terminal_client.DEFAULT_CELL_WIDTH, 24 * terminal_client.DEFAULT_CELL_HEIGHT))
         # nothing known at all:
         client.terminal_size = (0, 0, 0, 0)
-        self.assertEqual(client.get_subsystem("display").get_root_size(), (800, 480))
+        self.assertEqual(client.get_subsystem("display").get_root_size(),
+                         (terminal_client.DEFAULT_COLUMNS * terminal_client.DEFAULT_CELL_WIDTH,
+                          terminal_client.DEFAULT_ROWS * terminal_client.DEFAULT_CELL_HEIGHT))
 
     def test_cell_size(self):
         client = self.make_client()
@@ -789,28 +708,37 @@ class TerminalClientTest(unittest.TestCase):
         finally:
             client.unseal_std_streams()
         self.assertIsNone(client._sealed_fds)
-        data = open(sink.name, "rb").read()
+        with open(sink.name, "rb") as f:
+            data = f.read()
         self.assertIn(b"STRAY-STDOUT", data)
         self.assertIn(b"STRAY-STDERR", data)
         # sealing twice and unsealing twice must be safe:
         client.unseal_std_streams()
 
-    def test_typing_burst_requests_a_refresh(self):
-        # one refresh request per typing burst, to repair server-side damage holes:
+    def test_type_refresh_is_off_by_default(self):
         client, window_sub = self.make_input_client()
         self.add_window(client, window_sub, 1, (0, 0), (100, 100))
         client.kitty_keyboard = True
         client.process_input_events([KeyEvent(ord("a"), event_type=1, text="a")])
-        self.assertNotEqual(client.type_refresh_timer, 0)
-        first_timer = client.type_refresh_timer
-        # more typing re-arms the timer instead of stacking requests:
-        client.process_input_events([KeyEvent(ord("b"), event_type=1, text="b")])
-        self.assertNotEqual(client.type_refresh_timer, first_timer)
-        # a key release on its own does not arm it:
-        client.source_remove(client.type_refresh_timer)
-        client.type_refresh_timer = 0
-        client.process_input_events([KeyEvent(ord("b"), event_type=3)])
         self.assertEqual(client.type_refresh_timer, 0)
+
+    def test_typing_burst_requests_a_refresh(self):
+        # one refresh request per typing burst (`TYPE_REFRESH_DELAY`, off by default):
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        client.kitty_keyboard = True
+        with patch.object(terminal_client, "TYPE_REFRESH_DELAY", 750):
+            client.process_input_events([KeyEvent(ord("a"), event_type=1, text="a")])
+            self.assertNotEqual(client.type_refresh_timer, 0)
+            first_timer = client.type_refresh_timer
+            # more typing re-arms the timer instead of stacking requests:
+            client.process_input_events([KeyEvent(ord("b"), event_type=1, text="b")])
+            self.assertNotEqual(client.type_refresh_timer, first_timer)
+            # a key release on its own does not arm it:
+            client.source_remove(client.type_refresh_timer)
+            client.type_refresh_timer = 0
+            client.process_input_events([KeyEvent(ord("b"), event_type=3)])
+            self.assertEqual(client.type_refresh_timer, 0)
         # when the timer fires, the focused window is refreshed:
         client.type_refresh()
         self.assertEqual(window_sub.refreshes, [1])

@@ -131,6 +131,7 @@ Requires:			%{package_prefix}-client-gtk3 = %{version}-%{release}
 Requires:			%{package_prefix}-server = %{version}-%{release}
 Recommends:			%{package_prefix}-audio = %{version}-%{release}
 Suggests:           %{package_prefix}-client-tk = %{version}-%{release}
+Suggests:           %{package_prefix}-client-terminal = %{version}-%{release}
 Suggests:			%{package_prefix}-server-wayland = %{version}-%{release}
 Suggests:           %{package_prefix}-wayland = %{version}-%{release}
 %if 0%{?pyqt6}
@@ -454,6 +455,17 @@ Requires:			%{py3rpmname}-tkinter
 Requires:			%{py3rpmname}-pillow-tk
 %description -n %{package_prefix}-client-tk
 This package contains an experimental client using the tkinter toolkit.
+
+
+%package -n %{package_prefix}-client-terminal
+Summary:			xpra terminal client
+Provides:           %{package_prefix}-client-terminal
+# the shared `xpra/client/gui` and `xpra/client/subsystem` modules
+# are packaged with the GTK3 client:
+Requires:			%{package_prefix}-client-gtk3 = %{version}-%{release}
+%description -n %{package_prefix}-client-terminal
+This package contains the client rendering to a terminal emulator
+using the kitty graphics protocol.
 
 
 %package -n %{package_prefix}-client-gnome
@@ -912,6 +924,9 @@ rm -rf $RPM_BUILD_ROOT
 
 %files -n %{package_prefix}-client-tk
 %{python3_sitearch}/xpra/client/tk/
+
+%files -n %{package_prefix}-client-terminal
+%{python3_sitearch}/xpra/client/terminal/
 
 %files -n %{package_prefix}-client-gtk3
 %{python3_sitearch}/xpra/client/gui/

@@ -109,11 +109,8 @@ class OSC52Clipboard(ClipboardTimeoutHelper):
     """
 
     def __init__(self, send_packet_cb: Callable, progress_cb: Callable = noop, **kwargs):
-        # how we write to the terminal: the clipboard subsystem binds this to the client.
-        # without one (ie: unit tests), the sequences are just collected here:
-        self.osc52_data: list[bytes] = []
-        write = kwargs.pop("osc52-write", None)
-        self.osc52_write: Callable = write if callable(write) else self.osc52_data.append
+        # how we write to the terminal: the clipboard subsystem binds this to the client
+        self.osc52_write: Callable = kwargs.pop("osc52-write", noop)
         super().__init__(send_packet_cb, progress_cb, **kwargs)
         # `get_local_selections` returns whatever the platform has (ie: `PRIMARY`),
         # but OSC 52 only ever addresses the terminal's clipboard:

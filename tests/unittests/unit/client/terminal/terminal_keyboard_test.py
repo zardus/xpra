@@ -115,11 +115,10 @@ class TerminalKeyboardHelperTest(unittest.TestCase):
 
     def test_keyboard_class(self):
         helper = self.make_helper()[0]
+        # the `make_keyboard` factory must be used instead of the platform keyboard:
         self.assertIsInstance(helper.keyboard, terminal_keyboard.TerminalKeyboard)
+        self.assertIsInstance(helper.make_keyboard(), terminal_keyboard.TerminalKeyboard)
         self.assertEqual(repr(helper), "TerminalKeyboardHelper")
-        # the platform keyboard class must be left alone:
-        from xpra.platform import keyboard as platform_keyboard
-        self.assertIsNot(platform_keyboard.Keyboard, terminal_keyboard.TerminalKeyboard)
         # no key repeat value means no keyboard synchronization:
         self.assertEqual((helper.key_repeat_delay, helper.key_repeat_interval), (-1, -1))
 

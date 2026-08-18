@@ -78,7 +78,7 @@ def chunked(control: str, payload: bytes, cont: str = "") -> bytes:
     pos = MAX_CHUNK
     while pos < size:
         end = min(pos + MAX_CHUNK, size)
-        parts.append(escape("%sm=%i" % (prefix, int(end < size)), payload[pos:end]))
+        parts.append(escape(f"{prefix}m={int(end < size)}", payload[pos:end]))
         pos = end
     return b"".join(parts)
 

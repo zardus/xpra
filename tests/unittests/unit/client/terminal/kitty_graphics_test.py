@@ -8,36 +8,15 @@ import zlib
 import unittest
 from base64 import b64encode
 
+from unit.client.terminal.terminal_test_util import APC, ST, DECSC, DECRC, split_escapes
+
 try:
     from xpra.client.terminal import graphics
 except ImportError:
     graphics = None
 
-APC = b"\x1b_G"
-ST = b"\x1b\\"
-DECSC = b"\x1b7"
-DECRC = b"\x1b8"
-
 # 1 fully transparent RGBA pixel, which zlib makes bigger rather than smaller:
 PIXEL = b"\0\0\0\0"
-
-
-def split_escapes(data: bytes) -> list:
-    """ split a stream of kitty graphics escape sequences into (control, payload) pairs """
-    escapes = []
-    pos = 0
-    while pos < len(data):
-        if data[pos:pos + len(APC)] != APC:
-            raise ValueError(f"unexpected data at offset {pos}: {data[pos:pos + 8]!r}")
-        end = data.index(ST, pos)
-        body = data[pos + len(APC):end]
-        if b";" in body:
-            control, payload = body.split(b";", 1)
-        else:
-            control, payload = body, b""
-        escapes.append((control.decode("ascii"), payload))
-        pos = end + len(ST)
-    return escapes
 
 
 def raw_pixels(size: int) -> bytes:
@@ -62,10 +41,8 @@ def semi_random_pixels(size: int) -> bytes:
 class TestConstants(unittest.TestCase):
 
     def test_defaults(self):
-        self.assertEqual(graphics.MAX_CHUNK, 4096)
+        # the payload of every non-final chunk must be a multiple of 4:
         self.assertEqual(graphics.MAX_CHUNK % 4, 0)
-        self.assertEqual(graphics.CURSOR_IMAGE_ID, 0x7FFFFF00)
-        self.assertEqual(graphics.CURSOR_Z, 2 ** 30)
         self.assertEqual(graphics.FRAME_ACTION, "a=f")
 
     def test_escape_without_payload(self):

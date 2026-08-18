@@ -5,7 +5,6 @@
 # later version. See the file COPYING for details.
 
 import unittest
-from unittest.mock import patch
 
 from xpra.constants import Gravity
 from xpra.util.objects import typedict
@@ -165,13 +164,6 @@ class TerminalBackingTest(unittest.TestCase):
         # the old contents are anchored to the bottom right corner:
         self.assertEqual(b.pixels_for(2, 2, 2, 2), bytes((1, 2, 3, 4)) * 4)
         self.assertEqual(b.pixels_for(0, 0, 4, 2), bytes(4 * 2 * 4))
-
-    def test_init_copy_can_be_disabled(self):
-        b = self.make_backing(4, 2)
-        self.fill(b, 0xEE)
-        with patch.object(terminal_backing, "COPY_OLD_BACKING", False):
-            b.init(6, 4, 6, 4)
-        self.assertEqual(b.pixels, bytearray(6 * 4 * 4))
 
     def test_close_is_idempotent(self):
         b = self.make_backing()

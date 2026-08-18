@@ -10,19 +10,15 @@ from xpra.client.gui.window_base import ClientWindowBase
 from xpra.client.gui.window.backing import get_backing_client_properties
 from xpra.client.terminal import graphics
 from xpra.client.terminal.backing import TerminalBacking
+from xpra.client.terminal.tty import TerminalOutput
+from xpra.exit_codes import ExitCode
 from xpra.net.packet_type import WINDOW_MAP, WINDOW_UNMAP, WINDOW_CONFIGURE
 from xpra.util.objects import typedict
-from xpra.util.env import envint
 from xpra.log import Logger
 
 log = Logger("client", "terminal")
 geomlog = Logger("geometry")
 drawlog = Logger("paint", "terminal")
-
-# the cell size to assume when the terminal does not report its pixel size,
-# and before the client has measured it:
-DEFAULT_CELL_WIDTH: int = envint("XPRA_TERMINAL_CELL_WIDTH", 10)
-DEFAULT_CELL_HEIGHT: int = envint("XPRA_TERMINAL_CELL_HEIGHT", 20)
 
 # each window uses a single placement, the image id is the window id -
 # or the window id plus this offset: full image retransmits alternate
@@ -100,66 +96,18 @@ class ClientWindow(ClientWindowBase):
             "frozen": self._frozen,
             "placed": self._placed,
             "transmitted-serial": self._transmitted_serial,
-            "z": self.window_z(),
+            "z": self._client.window_z(self.wid),
         }
         return info
 
-    ######################################################################
-    # the interface we expect from the client
-    # (all of it is optional so that the window still works before the
-    # terminal has been switched into graphics mode)
-
-    def terminal_output(self):
+    def terminal_output(self) -> TerminalOutput | None:
         """ the single terminal writer, `None` when the terminal is not in graphics mode yet """
-        return getattr(self._client, "terminal_output", None)
-
-    def cell_size(self) -> tuple[int, int]:
-        """ the size of a terminal cell in pixels """
-        cell_size = getattr(self._client, "cell_size", None)
-        if not cell_size:
-            return DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
-        cw, ch = cell_size()
-        if cw <= 0 or ch <= 0:
-            return DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
-        return cw, ch
-
-    def terminal_pixel_size(self) -> tuple[int, int]:
-        """ the size of the terminal in pixels, `(0, 0)` when it is not known """
-        pixel_size = getattr(self._client, "terminal_pixel_size", None)
-        if not pixel_size:
-            return 0, 0
-        width, height = pixel_size()
-        return width, height
-
-    def frame_edits_supported(self) -> bool:
-        """ whether the terminal can patch a damaged region with an `a=f` frame edit """
-        return bool(getattr(self._client, "frame_edits", True))
-
-    def shm_supported(self) -> bool:
-        """ whether the pixels travel through shared memory (see `shm_transfer`) """
-        return bool(getattr(self._client, "shm_ok", False))
-
-    def shm_transfer(self, pixels) -> str:
-        """ store the pixels in a shared memory object, empty string when not in use """
-        shm_transfer = getattr(self._client, "shm_transfer", None)
-        if not callable(shm_transfer):
-            return ""
-        return shm_transfer(pixels)
-
-    def window_z(self) -> int:
-        """ the kitty `z` index the client assigned to this window """
-        window_z = getattr(self._client, "window_z", None)
-        if not window_z:
-            z = graphics.WINDOW_Z_BASE
-            if self._override_redirect:
-                z += graphics.OVERRIDE_REDIRECT_Z_OFFSET
-            return z
-        return window_z(self.wid)
+        return self._client.terminal_output
 
     ######################################################################
     # terminal output
 
-    def transmit_image(self, output) -> bool:
+    def transmit_image(self, output: TerminalOutput) -> bool:
         """ send the whole backing buffer as a new image, place it, then drop the old image """
         backing = self._backing
         if backing is None:
@@ -170,7 +118,7 @@ class ClientWindow(ClientWindowBase):
         old_id = self._image_id
         new_id = self.wid + BACK_IMAGE_OFFSET if old_id == self.wid else self.wid
         pixels = bytes(backing.pixels)
-        name = self.shm_transfer(pixels)
+        name = self._client.shm_transfer(pixels)
         if name:
             output.write(graphics.transmit_shm(new_id, bw, bh, name))
         else:
@@ -186,16 +134,17 @@ class ClientWindow(ClientWindowBase):
             output.write(graphics.delete_image(old_id))
         return True
 
-    def place_image(self, output) -> None:
-        cell_width, cell_height = self.cell_size()
-        max_width, max_height = self.terminal_pixel_size()
+    def place_image(self, output: TerminalOutput) -> None:
+        cell_width, cell_height = self._client.cell_size()
+        max_width, max_height = self._client.terminal_pixel_size()
         px, py = self._pos
         row, col, x_off, y_off = cell_position(px, py, cell_width, cell_height, max_width, max_height)
         geomlog("place_image() window %#x at %s -> cell %s offset %s", self.wid, (px, py), (row, col), (x_off, y_off))
-        output.write(graphics.place(self._image_id, PLACEMENT_ID, row, col, x_off, y_off, self.window_z()))
+        output.write(graphics.place(self._image_id, PLACEMENT_ID, row, col, x_off, y_off,
+                                    self._client.window_z(self.wid)))
         self._placed = True
 
-    def remove_placement(self, output) -> None:
+    def remove_placement(self, output: TerminalOutput) -> None:
         if not self._placed:
             return
         self._placed = False
@@ -261,8 +210,8 @@ class ClientWindow(ClientWindowBase):
         backing = self._backing
         if output is None or backing is None or not self._mapped or self._frozen:
             return
-        shm = self.shm_supported()
-        if self._transmitted_serial != backing.buffer_serial or not (shm or self.frame_edits_supported()):
+        shm = self._client.shm_ok
+        if self._transmitted_serial != backing.buffer_serial or not (shm or self._client.frame_edits):
             # the buffer was (re)allocated so the terminal has nothing to patch,
             # or this terminal cannot patch at all (no `a=f` frame edit support
             # and no shared memory to patch through):
@@ -277,7 +226,7 @@ class ClientWindow(ClientWindowBase):
                 continue
             pixels = backing.pixels_for(cx, cy, cw, ch)
             if shm:
-                name = self.shm_transfer(pixels)
+                name = self._client.shm_transfer(pixels)
                 if not name:
                     # shared memory just failed on us: re-send the whole image
                     # instead, the direct frame edit path may not be supported
@@ -325,9 +274,7 @@ class ClientWindow(ClientWindowBase):
         # the client may only give a window the focus once the server has seen it
         # mapped: focusing an unmapped window is a `BadMatch` the server swallows,
         # which leaves the X input focus on `PointerRoot`:
-        mapped = getattr(self._client, "window_mapped", None)
-        if callable(mapped):
-            mapped(self)
+        self._client.window_mapped(self)
 
     def hide(self) -> None:
         if not self._mapped:
@@ -361,7 +308,7 @@ class ClientWindow(ClientWindowBase):
     def quit(self) -> None:
         """ detach from the server: the default `#+F4:quit` shortcut lands here """
         log.info("quit shortcut: detaching")
-        self._client.quit(0)
+        self._client.quit(ExitCode.OK)
 
     ######################################################################
     # geometry
@@ -381,7 +328,7 @@ class ClientWindow(ClientWindowBase):
         """
         if not self.is_desktop():
             return
-        width, height = self.terminal_pixel_size()
+        width, height = self._client.terminal_pixel_size()
         if width <= 0 or height <= 0 or (width, height) == tuple(self._size):
             return
         geomlog("fit_to_terminal() window %#x: asking for %s, showing %s",
@@ -470,28 +417,21 @@ class ClientWindow(ClientWindowBase):
     # stacking and focus
 
     def present(self) -> None:
-        raise_window = getattr(self._client, "raise_window", None)
-        if raise_window:
-            raise_window(self.wid)
+        self._client.raise_window(self.wid)
         self.refresh_placement()
         # the client owns the focus state that key events are routed with,
         # and it forwards the focus to the window subsystem:
-        focus_window = getattr(self._client, "focus_window", None)
-        if focus_window:
-            focus_window(self.wid)
-        elif window := self.get_subsystem("window"):
-            window.update_focus(self.wid, True)
+        self._client.focus_window(self.wid)
 
     def restack(self, other_window, above: int = 0) -> None:
-        other_wid = getattr(other_window, "wid", 0)
+        # `other_window` is `None` when the sibling is not one of our windows:
+        other_wid = other_window.wid if other_window is not None else 0
         log("restack(%s, %s) window %#x", other_window, above, self.wid)
-        restack_window = getattr(self._client, "restack_window", None)
-        if restack_window:
-            restack_window(self.wid, other_wid, above)
+        self._client.restack_window(self.wid, other_wid, above)
         self.refresh_placement()
 
     def has_toplevel_focus(self) -> bool:
-        return getattr(self._client, "_focused", 0) == self.wid
+        return self._client._focused == self.wid
 
     ######################################################################
     # suspend / resume

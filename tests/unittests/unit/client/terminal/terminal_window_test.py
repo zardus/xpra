@@ -13,69 +13,17 @@ os.environ.setdefault("XPRA_UNIT_TEST", "1")
 
 from xpra.util.objects import typedict                                  # noqa: E402
 from xpra.net.packet_type import WINDOW_MAP, WINDOW_UNMAP, WINDOW_CONFIGURE   # noqa: E402
+from unit.client.terminal.terminal_test_util import parse_output, actions, graphics_keys   # noqa: E402
 
 try:
-    from xpra.client.terminal import graphics
     from xpra.client.terminal.tty import TerminalOutput
     from xpra.client.terminal.backing import TerminalBacking
     from xpra.client.terminal.window import ClientWindow, cell_position
 except ImportError:
-    graphics = None
     TerminalOutput = None
     TerminalBacking = None
     ClientWindow = None
     cell_position = None
-
-APC = b"\x1b_G"
-ST = b"\x1b\\"
-
-
-def parse_output(data: bytes) -> list:
-    """
-    Decode a terminal byte stream into commands:
-    `("graphics", {key: value}, payload)`, `("cup", (row, col))`, `("save",)`, `("restore",)`
-    """
-    commands = []
-    pos = 0
-    while pos < len(data):
-        if data[pos] != 0x1b:
-            raise ValueError(f"unexpected data at offset {pos}: {data[pos:pos + 8]!r}")
-        if data[pos:pos + 3] == APC:
-            end = data.index(ST, pos)
-            control, _, payload = data[pos + 3:end].partition(b";")
-            keys = {}
-            for kv in control.decode("ascii").split(","):
-                if kv:
-                    key, _, value = kv.partition("=")
-                    keys[key] = value
-            commands.append(("graphics", keys, payload))
-            pos = end + len(ST)
-        elif data[pos:pos + 2] == b"\x1b[":
-            end = pos + 2
-            while end < len(data) and not 0x40 <= data[end] <= 0x7E:
-                end += 1
-            body = data[pos + 2:end].decode("ascii")
-            if chr(data[end]) == "H":
-                row, _, col = body.partition(";")
-                commands.append(("cup", (int(row), int(col))))
-            pos = end + 1
-        elif data[pos:pos + 2] == b"\x1b7":
-            commands.append(("save",))
-            pos += 2
-        elif data[pos:pos + 2] == b"\x1b8":
-            commands.append(("restore",))
-            pos += 2
-        else:
-            raise ValueError(f"unexpected escape sequence at offset {pos}: {data[pos:pos + 8]!r}")
-    return commands
-
-
-def actions(commands) -> list:
-    return [cmd[1].get("a") for cmd in commands if cmd[0] == "graphics"]
-
-
-def graphics_keys(commands, action: str) -> list:
-    return [cmd[1] for cmd in commands if cmd[0] == "graphics" and cmd[1].get("a") == action]
 
 
 class FakeWindowSubsystem:
@@ -93,6 +41,7 @@ class FakeClient:
     title = "@title@"
     headerbar = "no"
     frame_edits = True
+    shm_ok = False
 
     def __init__(self, cell=(10, 20), pixel_size=(800, 480)):
         self.packets = []
@@ -103,6 +52,7 @@ class FakeClient:
         self.zorder = {}
         self.raised = []
         self.restacked = []
+        self.mapped = []
         self._cell = cell
         self._pixel_size = pixel_size
 
@@ -130,6 +80,13 @@ class FakeClient:
 
     def window_z(self, wid: int) -> int:
         return self.zorder.get(wid, 10)
+
+    def window_mapped(self, window) -> None:
+        self.mapped.append(window.wid)
+
+    def shm_transfer(self, pixels) -> str:
+        # mirrors `XpraTerminalClient.shm_transfer` with shared memory off:
+        return ""
 
     def raise_window(self, wid: int) -> None:
         self.raised.append(wid)
@@ -338,18 +295,12 @@ class TerminalWindowTest(unittest.TestCase):
         window.show_all()
         self.assertEqual(graphics_keys(client.commands(), "p")[0]["z"], "16")
 
-    def test_default_z_without_client_support(self):
+    def test_map_notifies_the_client(self):
+        # the client gives a freshly mapped window the focus if nothing has it,
+        # and it may only do so after the map packet was sent (see `send_map`):
         client, window = self.make_window()
-        client.window_z = None
         window.show_all()
-        self.assertEqual(graphics_keys(client.commands(), "p")[0]["z"], str(graphics.WINDOW_Z_BASE))
-
-    def test_default_z_for_override_redirect(self):
-        client, window = self.make_window(override_redirect=True)
-        client.window_z = None
-        window.show_all()
-        expected = graphics.WINDOW_Z_BASE + graphics.OVERRIDE_REDIRECT_Z_OFFSET
-        self.assertEqual(graphics_keys(client.commands(), "p")[0]["z"], str(expected))
+        self.assertEqual(client.mapped, [1])
 
     ######################################################################
     # paint / present
@@ -681,13 +632,6 @@ class TerminalWindowTest(unittest.TestCase):
         self.assertEqual(client._focused, 1)
         self.assertTrue(window.has_toplevel_focus())
         self.assertFalse(other.has_toplevel_focus())
-
-    def test_present_falls_back_to_the_window_subsystem(self):
-        client, window = self.make_window()
-        client.focus_window = None
-        window.show_all()
-        window.present()
-        self.assertEqual(client.subsystems["window"].focus_events, [(1, True)])
 
     def test_restack(self):
         client, window = self.make_window()

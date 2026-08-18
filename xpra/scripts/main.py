@@ -1880,7 +1880,10 @@ def make_client(opts):
         # there is no OpenGL rendering into a terminal
         # (`get_gl_client_window_module()` never returns one):
         opts.opengl = "no"
-        # and nowhere to show a system tray icon:
+        # there is nowhere to put a system tray icon in a terminal
+        # (`get_system_tray_classes()` returns nothing), so the tray forwarding
+        # must not be advertised to the server - it would send us tray windows
+        # we have no way of creating:
         opts.system_tray = False
         # the terminal client composes its subsystems from the client features,
         # which is why the options above are turned off first:

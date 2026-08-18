@@ -33,6 +33,12 @@ SERVER_CAPS = {
 @unittest.skipIf(terminal_display is None, "the terminal client component is not available")
 class TerminalDisplayClientTest(ClientMixinTest):
 
+    def terminal_pixel_size(self) -> tuple[int, int]:
+        # this test class stands in for the client: like the real client before
+        # the first terminal reading, it has no pixel size to report
+        # (the tests override this with the size they need):
+        return 0, 0
+
     def setUp(self):
         super().setUp()
         # the terminal client never initializes an X11 display source, so the platform
@@ -62,7 +68,6 @@ class TerminalDisplayClientTest(ClientMixinTest):
         return opts
 
     def test_root_size(self):
-        # the client provides the terminal size, this test class stands in for it:
         self.terminal_pixel_size = lambda: TERMINAL_SIZE
         self.init_mixin()
         self.assertEqual(self.mixin.get_root_size(), TERMINAL_SIZE)
@@ -72,16 +77,12 @@ class TerminalDisplayClientTest(ClientMixinTest):
         self.assertEqual((self.mixin.xscale, self.mixin.yscale), (1, 1))
 
     def test_root_size_default(self):
-        # no `terminal_pixel_size` at all (as during the very first `init`):
+        # a terminal which does not know its pixel size yet reports zeroes,
+        # and the default geometry constants take over:
         self.init_mixin()
         default_size = terminal_display.DEFAULT_ROOT_SIZE
-        self.assertEqual(default_size, (800, 480))
-        self.assertEqual(self.mixin.get_root_size(), default_size)
-        # a terminal which does not know its pixel size reports zeroes:
-        self.terminal_pixel_size = lambda: (0, 0)
-        self.assertEqual(self.mixin.get_root_size(), default_size)
-        # or nothing at all:
-        self.terminal_pixel_size = lambda: ()
+        self.assertEqual(default_size, (terminal_display.DEFAULT_COLUMNS * terminal_display.DEFAULT_CELL_WIDTH,
+                                        terminal_display.DEFAULT_ROWS * terminal_display.DEFAULT_CELL_HEIGHT))
         self.assertEqual(self.mixin.get_root_size(), default_size)
 
     def test_no_xsettings_watcher(self):

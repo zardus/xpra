@@ -8,10 +8,10 @@ import os
 import fcntl
 import struct
 import termios
+import tempfile
 import unittest
 from io import BytesIO
-
-from xpra.util.env import OSEnvContext
+from unittest.mock import patch
 
 from unit.test_util import silence_error
 
@@ -20,10 +20,14 @@ try:
 except ImportError:
     tty_module = None
 
-# the exact byte sequences the terminal context is contracted to emit:
-ENTER = (b"\x1b[?1049h\x1b[?25l\x1b[>31u"
-         b"\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h"
-         b"\x1b[14t\x1b[16t")
+# the exact byte sequences the terminal context is contracted to emit
+# (the keyboard flags are an env tunable, so the golden bytes derive from the constant):
+if tty_module is not None:
+    ENTER = (b"\x1b[?1049h\x1b[?25l" + b"\x1b[>%iu" % tty_module.KEYBOARD_FLAGS +
+             b"\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1016h"
+             b"\x1b[14t\x1b[16t")
+else:
+    ENTER = b""
 EXIT = b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[<u\x1b[?25h\x1b[?1049l"
 
 
@@ -109,9 +113,6 @@ class TestTerminalOutput(unittest.TestCase):
             output.flush()
         self.assertTrue(output.failed)
 
-    def test_repr(self):
-        self.assertIn("TerminalOutput", repr(tty_module.TerminalOutput(BytesIO())))
-
 
 @unittest.skipIf(tty_module is None, "the terminal client tty module is not available")
 class TestMakeRaw(unittest.TestCase):
@@ -154,11 +155,10 @@ class TestTerminalContext(unittest.TestCase):
         return self.buf.getvalue()
 
     def test_defaults(self):
-        # 31 = 1 disambiguate | 2 event types | 4 alternate keys | 8 all keys as escapes
+        # 1 disambiguate | 2 event types | 4 alternate keys | 8 all keys as escapes
         # | 16 report associated text.
         # 16 is what makes shift + `a` arrive as `A`, and 2 must stay set:
         # the client uses it to decide whether the terminal reports key releases
-        self.assertEqual(tty_module.KEYBOARD_FLAGS, 31)
         for bit in (1, 2, 4, 8, 16):
             self.assertTrue(tty_module.KEYBOARD_FLAGS & bit, f"keyboard flag {bit} is not requested")
         self.assertEqual(tty_module.MOUSE_MODES, (1002, 1003, 1006, 1016))
@@ -177,7 +177,7 @@ class TestTerminalContext(unittest.TestCase):
         expected_order = (
             b"\x1b[?1049h",     # alternate screen first
             b"\x1b[?25l",       # then hide the cursor
-            b"\x1b[>31u",       # then push the kitty keyboard flags
+            b"\x1b[>%iu" % tty_module.KEYBOARD_FLAGS,       # then push the kitty keyboard flags
             b"\x1b[?1002h",     # then the mouse modes, in ascending order
             b"\x1b[?1003h",
             b"\x1b[?1006h",
@@ -251,9 +251,6 @@ class TestTerminalContext(unittest.TestCase):
         self.assertEqual(self.written(), ENTER + EXIT + ENTER)
         self.assertTrue(self.context.active)
         self.context.exit()
-
-    def test_repr(self):
-        self.assertIn("TerminalContext", repr(self.context))
 
     def test_non_terminal_fd_still_emits_the_escape_sequences(self):
         read_fd, write_fd = os.pipe()
@@ -357,22 +354,16 @@ class TestCellSizeFromReport(unittest.TestCase):
 class TestCaptureTee(unittest.TestCase):
 
     def test_capture_records_every_byte(self):
-        import importlib
-        import tempfile
-        from xpra.client.terminal import tty as tty_module
-        cap = tempfile.mktemp()
-        with OSEnvContext(XPRA_TERMINAL_CAPTURE=cap):
-            importlib.reload(tty_module)
-            try:
-                buf = BytesIO()
-                out = tty_module.TerminalOutput(buf)  # noqa: F821
-                out.write(b"\x1b_Ga=t;AAAA\x1b\\")
-                out.write(b"plain")
-                out.flush()
-                self.assertEqual(open(cap, "rb").read(), buf.getvalue())
-            finally:
-                os.unlink(cap)
-        importlib.reload(tty_module)
+        # `TerminalOutput` opens the capture file per instance,
+        # so pinning the module constant is all it takes:
+        with tempfile.NamedTemporaryFile() as capture, \
+                patch.object(tty_module, "CAPTURE_FILE", capture.name):
+            buf = BytesIO()
+            out = tty_module.TerminalOutput(buf)
+            out.write(b"\x1b_Ga=t;AAAA\x1b\\")
+            out.write(b"plain")
+            out.flush()
+            self.assertEqual(capture.read(), buf.getvalue())
 
 
 def main():

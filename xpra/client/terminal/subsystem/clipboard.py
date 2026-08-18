@@ -34,11 +34,7 @@ class TerminalClipboardClient(ClipboardClient):
         options: dict[str, Any] = parse_simple_dict(parts[1]) if len(parts) > 1 else {}
         # the client owns the terminal: it is the only writer
         # (`write_osc52` is expected to defer to the UI thread if needed)
-        write = getattr(self.client, "write_osc52", None)
-        if callable(write):
-            options["osc52-write"] = write
-        else:
-            log("make_clipboard_helper() %s has no 'write_osc52' method", self.client)
+        options["osc52-write"] = self.client.write_osc52
         try:
             return self.setup_clipboard_helper(OSC52Clipboard, options)
         except (ImportError, AttributeError, RuntimeError) as e:

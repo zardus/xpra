@@ -11,6 +11,7 @@ from xpra.util.env import OSEnvContext
 from xpra.util.objects import typedict
 from xpra.client.gui import ui_client_base
 from unit.test_util import silence_info
+from unit.client.terminal.terminal_test_util import TERMINAL_SIZE, placements
 
 try:
     from xpra.client.terminal import graphics
@@ -22,31 +23,6 @@ except ImportError:
     terminal_client = None
     TerminalOutput = None
     ClientWindow = None
-
-# (columns, rows, width in pixels, height in pixels)
-TERMINAL_SIZE = (100, 30, 1000, 600)
-
-APC = b"\x1b_G"
-ST = b"\x1b\\"
-
-
-def placements(data: bytes) -> list[tuple[int, int]]:
-    """ the `(image id, z index)` of every placement in a terminal byte stream, in order """
-    found: list[tuple[int, int]] = []
-    pos = 0
-    while True:
-        pos = data.find(APC, pos)
-        if pos < 0:
-            return found
-        end = data.index(ST, pos)
-        keys: dict[str, str] = {}
-        control = data[pos + len(APC):end].partition(b";")[0]
-        for kv in control.decode("ascii").split(","):
-            key, _, value = kv.partition("=")
-            keys[key] = value
-        if keys.get("a") == "p":
-            found.append((int(keys["i"]), int(keys["z"])))
-        pos = end + len(ST)
 
 
 @unittest.skipIf(terminal_client is None, "the terminal client component is not available")

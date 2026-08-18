@@ -27,11 +27,10 @@ def osc52_bytes(text: str) -> bytes:
 class FakeClient:
     """ the terminal client, as far as the clipboard subsystem is concerned """
 
-    def __init__(self, osc52=True):
+    def __init__(self):
         self.written: list[bytes] = []
         self.packets: list[tuple] = []
-        if osc52:
-            self.write_osc52 = self.written.append
+        self.write_osc52 = self.written.append
 
     def send_now(self, *packet) -> None:
         self.packets.append(packet)
@@ -41,17 +40,20 @@ class FakeClient:
 class OSC52ClipboardTest(unittest.TestCase):
 
     def make_helper(self, **kwargs):
-        packets = []
+        packets: list[tuple] = []
+        # `osc52_write` defaults to `noop`, the tests inject a collector:
+        written: list[bytes] = []
         kwargs.setdefault("can-send", True)
         kwargs.setdefault("can-receive", True)
+        kwargs.setdefault("osc52-write", written.append)
         helper = terminal_clipboard.OSC52Clipboard(lambda *packet: packets.append(packet), **kwargs)
         self.addCleanup(helper.cleanup)
         helper.enable_selections(("CLIPBOARD", ))
-        return helper, packets
+        return helper, packets, written
 
     def make_proxy(self, **kwargs):
-        helper = self.make_helper(**kwargs)[0]
-        return helper, helper._clipboard_proxies["CLIPBOARD"]
+        helper, _, written = self.make_helper(**kwargs)
+        return helper._clipboard_proxies["CLIPBOARD"], written
 
     def test_osc52_sequence(self):
         # `ESC ] 52 ; c ; <base64> BEL`
@@ -85,27 +87,27 @@ class OSC52ClipboardTest(unittest.TestCase):
 
     def send_token_packet(self, targets, data) -> Packet:
         """ the wire packet a peer sends for a token with these targets and contents """
-        peer, packets = self.make_helper()
+        peer, packets, _ = self.make_helper()
         peer_proxy = peer._clipboard_proxies["CLIPBOARD"]
         peer._send_clipboard_token_handler(peer_proxy, {"targets": targets, "data": data})
         self.assertEqual(len(packets), 1, f"expected a single packet, got {packets}")
         return Packet(*packets[0])
 
     def test_token_round_trip(self):
-        helper = self.make_helper()[0]
+        helper, _, written = self.make_helper()
         # a greedy client gets the contents with the token:
         packet = self.send_token_packet(("UTF8_STRING", ),
                                         {"UTF8_STRING": ("UTF8_STRING", 8, b"from the peer")})
         helper.process_clipboard_packet(packet)
-        self.assertEqual(helper.osc52_data, [osc52_bytes("from the peer")])
+        self.assertEqual(written, [osc52_bytes("from the peer")])
         # a peer which does not send the contents leaves us with nothing to write,
         # which is why we must ask for them in the capabilities:
-        helper.osc52_data.clear()
+        written.clear()
         helper.process_clipboard_packet(self.send_token_packet((), {}))
-        self.assertEqual(helper.osc52_data, [])
+        self.assertEqual(written, [])
 
     def test_got_token_text(self):
-        helper, proxy = self.make_proxy()
+        proxy, written = self.make_proxy()
         for target, dtype, data, text in (
             ("UTF8_STRING", "UTF8_STRING", "howdy".encode("utf8"), "howdy"),
             ("UTF8_STRING", "UTF8_STRING", "héllo ☃".encode("utf8"), "héllo ☃"),
@@ -115,15 +117,15 @@ class OSC52ClipboardTest(unittest.TestCase):
             # not all peers send bytes:
             ("UTF8_STRING", "UTF8_STRING", "as a string", "as a string"),
         ):
-            helper.osc52_data.clear()
+            written.clear()
             proxy.got_token((target, ), {target: (dtype, 8, data)})
-            self.assertEqual(helper.osc52_data, [osc52_bytes(text)], f"for target {target!r}")
+            self.assertEqual(written, [osc52_bytes(text)], f"for target {target!r}")
 
     def test_got_token_ignored(self):
-        helper, proxy = self.make_proxy()
+        proxy, written = self.make_proxy()
 
         def nothing_written(reason: str) -> None:
-            self.assertEqual(helper.osc52_data, [], f"clipboard data was written {reason}")
+            self.assertEqual(written, [], f"clipboard data was written {reason}")
 
         proxy.got_token(("UTF8_STRING", ), {})
         nothing_written("for an empty token")
@@ -140,30 +142,41 @@ class OSC52ClipboardTest(unittest.TestCase):
     def test_direction(self):
         token = (("UTF8_STRING", ), {"UTF8_STRING": ("UTF8_STRING", 8, b"data")})
         # `--clipboard-direction=to-server`: we must not update the terminal's clipboard
-        helper, proxy = self.make_proxy(**{"can-receive": False})
+        proxy, written = self.make_proxy(**{"can-receive": False})
         self.assertFalse(proxy._can_receive)
         proxy.got_token(*token)
-        self.assertEqual(helper.osc52_data, [])
+        self.assertEqual(written, [])
         # a disabled selection is never updated either:
-        helper, proxy = self.make_proxy()
+        proxy, written = self.make_proxy()
         proxy.set_enabled(False)
         proxy.got_token(*token)
-        self.assertEqual(helper.osc52_data, [])
+        self.assertEqual(written, [])
         # `--clipboard-direction=to-client` still writes to the terminal:
-        helper, proxy = self.make_proxy(**{"can-send": False})
+        proxy, written = self.make_proxy(**{"can-send": False})
         self.assertFalse(proxy._can_send)
         proxy.got_token(*token)
-        self.assertEqual(helper.osc52_data, [osc52_bytes("data")])
+        self.assertEqual(written, [osc52_bytes("data")])
+
+    def test_without_a_writer_nothing_is_emitted(self):
+        # `osc52_write` defaults to `noop`: a helper built without one must not raise
+        from xpra.common import noop
+        helper = terminal_clipboard.OSC52Clipboard(lambda *packet: None,
+                                                   **{"can-send": True, "can-receive": True})
+        self.addCleanup(helper.cleanup)
+        helper.enable_selections(("CLIPBOARD", ))
+        proxy = helper._clipboard_proxies["CLIPBOARD"]
+        self.assertIs(proxy.osc52_write, noop)
+        proxy.got_token(("UTF8_STRING", ), {"UTF8_STRING": ("UTF8_STRING", 8, b"dropped")})
 
     def test_too_much_data(self):
-        helper, proxy = self.make_proxy()
+        proxy, written = self.make_proxy()
         text = "x" * terminal_clipboard.MAX_OSC52_SIZE
         with silence_warn(terminal_clipboard):
             proxy.got_token(("UTF8_STRING", ), {"UTF8_STRING": ("UTF8_STRING", 8, text.encode())})
-        self.assertEqual(helper.osc52_data, [])
+        self.assertEqual(written, [])
 
     def test_get_contents(self):
-        proxy = self.make_proxy()[1]
+        proxy = self.make_proxy()[0]
         contents = []
         proxy.get_contents("TARGETS", lambda *args: contents.append(args))
         self.assertEqual(len(contents), 1)
@@ -177,7 +190,7 @@ class OSC52ClipboardTest(unittest.TestCase):
         self.assertEqual(contents, [("UTF8_STRING", 0, b"")])
 
     def test_never_claims(self):
-        helper, packets = self.make_helper()
+        helper, packets, _ = self.make_helper()
         proxy = helper._clipboard_proxies["CLIPBOARD"]
         # the peer claiming the selection does not make us claim ours:
         proxy.got_token(("UTF8_STRING", ), {"UTF8_STRING": ("UTF8_STRING", 8, b"data")}, True)
@@ -221,16 +234,6 @@ class TerminalClipboardClientTest(unittest.TestCase):
         proxy.got_token(("UTF8_STRING", ), {"UTF8_STRING": ("UTF8_STRING", 8, b"from the server")})
         self.assertEqual(client.written, [osc52_bytes("from the server")])
         self.assertEqual(client.packets, [])
-
-    def test_no_terminal(self):
-        # a client which cannot write to a terminal (ie: this test):
-        subsystem = self.make_subsystem(FakeClient(osc52=False))
-        helper = subsystem.make_clipboard_helper()
-        self.addCleanup(helper.cleanup)
-        helper.enable_selections(("CLIPBOARD", ))
-        proxy = helper._clipboard_proxies["CLIPBOARD"]
-        proxy.got_token(("UTF8_STRING", ), {"UTF8_STRING": ("UTF8_STRING", 8, b"nowhere")})
-        self.assertEqual(helper.osc52_data, [osc52_bytes("nowhere")])
 
     def test_direction_options(self):
         subsystem = self.make_subsystem(FakeClient(), direction="to-server")
