@@ -593,6 +593,69 @@ class TerminalClientTest(unittest.TestCase):
             os.close(rfd)
             os.close(wfd)
 
+    def test_lost_modifier_release_is_synthesized(self):
+        # replay of a real kitty-on-Wayland trace: ctrl pressed, its release
+        # swallowed by the compositor (alt-tab), then plain letters - without
+        # the reconciliation every letter becomes a control chord on the server
+        # (`a` = beginning-of-line, `p` = previous-history: mangled typing):
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        client.kitty_keyboard = True
+        client.process_input_events([KeyEvent(57442, mods=4, event_type=1)])       # Control_L press
+        self.assertEqual(client._mod_keys_down, {57442: 4})
+        # a chorded letter while ctrl is genuinely held is left alone:
+        client.process_input_events([KeyEvent(ord("c"), mods=4, event_type=1, text=""),
+                                     KeyEvent(ord("c"), mods=4, event_type=3)])
+        self.assertNotIn(("Control_L", False), [(a[1], a[2]) for a in kb.actions])
+        # the release never arrives, the next letter reports ctrl as gone:
+        kb.actions.clear()
+        client.process_input_events([KeyEvent(ord("a"), event_type=1, text="a")])
+        names = [(a[1], a[2]) for a in kb.actions]
+        self.assertEqual(names[0], ("Control_L", False), names)
+        self.assertEqual(names[1], ("a", True), names)
+        self.assertEqual(client._mod_keys_down, {})
+
+    def test_modifier_repeat_without_press_is_tracked(self):
+        # kitty can send repeat events for a modifier whose press we never saw:
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        client.kitty_keyboard = True
+        client.process_input_events([KeyEvent(57443, mods=2, event_type=2)])       # Alt_L repeat
+        self.assertEqual(client._mod_keys_down, {57443: 2})
+        kb.actions.clear()
+        client.process_input_events([KeyEvent(ord("x"), event_type=1, text="x")])
+        self.assertEqual([(a[1], a[2]) for a in kb.actions], [("Alt_L", False), ("x", True)])
+
+    def test_both_control_keys_held(self):
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        client.kitty_keyboard = True
+        client.process_input_events([KeyEvent(57442, mods=4, event_type=1),
+                                     KeyEvent(57448, mods=4, event_type=1)])
+        # releasing one of them keeps the bit set - nothing must be synthesized:
+        client.process_input_events([KeyEvent(57442, mods=4, event_type=3)])
+        self.assertEqual(client._mod_keys_down, {57448: 4})
+        kb.actions.clear()
+        client.process_input_events([KeyEvent(ord("y"), mods=4, event_type=1, text="")])
+        self.assertNotIn(("Control_R", False), [(a[1], a[2]) for a in kb.actions])
+        # once the bit clears, the remaining key is released:
+        client.process_input_events([KeyEvent(ord("y"), event_type=3)])
+        self.assertIn(("Control_R", False), [(a[1], a[2]) for a in kb.actions])
+
+    def test_held_modifiers_are_released_on_the_way_out(self):
+        client, window_sub = self.make_input_client()
+        self.add_window(client, window_sub, 1, (0, 0), (100, 100))
+        kb = client.subsystems["keyboard"]
+        client.kitty_keyboard = True
+        client.process_input_events([KeyEvent(57442, mods=4, event_type=1)])
+        kb.actions.clear()
+        client.stop_terminal_mode()
+        self.assertEqual([(a[1], a[2]) for a in kb.actions], [("Control_L", False)])
+        self.assertEqual(client._mod_keys_down, {})
+
     def test_typing_burst_requests_a_refresh(self):
         # one refresh request per typing burst, to repair server-side damage holes:
         client, window_sub = self.make_input_client()

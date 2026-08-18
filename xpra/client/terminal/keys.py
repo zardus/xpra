@@ -120,6 +120,19 @@ def _build_functional_keysyms() -> dict[int, str]:
 FUNCTIONAL_KEYSYMS: Final[dict[int, str]] = _build_functional_keysyms()
 
 
+# the kitty key codes of the (non-lock) modifier keys, with the kitty modifier
+# bit each one drives - the lock keys are deliberately absent: their bit
+# reflects the lock state, not whether the key is physically held:
+MODIFIER_CODE_BITS: Final[dict[int, int]] = {
+    57441: MOD_SHIFT, 57447: MOD_SHIFT,      # Shift_L, Shift_R
+    57442: MOD_CTRL, 57448: MOD_CTRL,        # Control_L, Control_R
+    57443: MOD_ALT, 57449: MOD_ALT,          # Alt_L, Alt_R
+    57444: MOD_SUPER, 57450: MOD_SUPER,      # Super_L, Super_R
+    57445: MOD_HYPER, 57451: MOD_HYPER,      # Hyper_L, Hyper_R
+    57446: MOD_META, 57452: MOD_META,        # Meta_L, Meta_R
+}
+
+
 def keysym_name_for(code: int, text: str) -> str:
     """ the X11 keysym name for a key reported by the terminal """
     name = FUNCTIONAL_KEYSYMS.get(code, "")

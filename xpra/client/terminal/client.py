@@ -29,7 +29,7 @@ from xpra.client.terminal.input import (
     InputParser, KeyEvent, MouseEvent, GraphicsResponse, KeyboardFlagsResponse, TextReport,
     KEY_PRESS, KEY_REPEAT, KEY_RELEASE,
 )
-from xpra.client.terminal.keys import make_key_event, modifier_names
+from xpra.client.terminal.keys import make_key_event, modifier_names, MODIFIER_CODE_BITS
 from xpra.client.terminal.backing import to_rgba
 from xpra.client.terminal.window import cell_position, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
 from xpra.log import Logger, setloghandler
@@ -199,6 +199,10 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self._pointer_pos: tuple[int, int] = (0, 0)
         # `True` once a real mouse event has arrived from the terminal:
         self._pointer_synced: bool = False
+        # the modifier keys we forwarded as pressed: kitty key code -> modifier bit.
+        # used to synthesize the releases the terminal never delivers
+        # (alt-tabbing away mid-chord sends the release to another window):
+        self._mod_keys_down: dict[int, int] = {}
         self._buttons: list[int] = []
         self._modifiers: list[str] = []
         # cursor state:
@@ -294,6 +298,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
 
     def stop_terminal_mode(self) -> None:
         """ restore the terminal - idempotent, and safe to call before `run()` """
+        self.release_held_modifiers()
         if iw := self.input_watch:
             self.input_watch = 0
             self.source_remove(iw)
@@ -567,6 +572,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         keylog("handle_key_event(%s) focused=%#x, window=%s", event, self._focused, window)
         if kb is None or window is None:
             return
+        self.reconcile_modifiers(kb, window, event)
+        self.track_modifier(event)
         kb.handle_key_action(window, make_key_event(event))
         if not self.kitty_keyboard and event.event_type in (KEY_PRESS, KEY_REPEAT):
             # a terminal which does not report key releases: synthesize one,
@@ -576,6 +583,47 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             kb.handle_key_action(window, make_key_event(release))
         if event.event_type in (KEY_PRESS, KEY_REPEAT):
             self.schedule_type_refresh()
+
+    def reconcile_modifiers(self, kb, window, event: KeyEvent) -> None:
+        """
+        Every kitty key event carries the true modifier state in its `mods`
+        bitfield.  When it says a modifier is no longer held but we never saw
+        that key's release (the release went to another window - alt-tabbing
+        away mid-chord does exactly that), the modifier key would stay pressed
+        on the server forever and every subsequent letter would turn into a
+        chord (`a` = beginning-of-line, `p` = previous-history, ...).
+        Synthesize the missing release before forwarding the event.
+        """
+        for code, bit in tuple(self._mod_keys_down.items()):
+            if code == event.code:
+                continue
+            if event.mods & bit:
+                continue
+            keylog.info("releasing stuck modifier key %i (its release never arrived)", code)
+            release = KeyEvent(code, 0, 0, event.mods, KEY_RELEASE, "")
+            del self._mod_keys_down[code]
+            kb.handle_key_action(window, make_key_event(release))
+
+    def track_modifier(self, event: KeyEvent) -> None:
+        bit = MODIFIER_CODE_BITS.get(event.code, 0)
+        if not bit:
+            return
+        if event.event_type in (KEY_PRESS, KEY_REPEAT):
+            self._mod_keys_down[event.code] = bit
+        else:
+            self._mod_keys_down.pop(event.code, None)
+
+    def release_held_modifiers(self) -> None:
+        """ best effort on the way out: do not leave modifier keys pressed on the server """
+        kb = self.get_subsystem("keyboard")
+        window = self.get_window(self._focused)
+        held = self._mod_keys_down
+        self._mod_keys_down = {}
+        if kb is None or window is None:
+            return
+        for code in held:
+            release = KeyEvent(code, 0, 0, 0, KEY_RELEASE, "")
+            kb.handle_key_action(window, make_key_event(release))
 
     def schedule_type_refresh(self) -> None:
         """
