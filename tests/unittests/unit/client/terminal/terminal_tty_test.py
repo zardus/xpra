@@ -57,6 +57,25 @@ class TestTerminalOutput(unittest.TestCase):
         output.flush()
         self.assertEqual(buf.getvalue(), b"hello world")
 
+    def test_partial_raw_writes_are_completed(self):
+        # a raw (unbuffered) writer may write less than the whole buffer,
+        # e.g. when a signal arrives mid-write: the remainder must be written
+        # too, anything else would truncate an escape sequence:
+        class ShortWriter:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, data) -> int:
+                take = min(3, len(data))
+                self.data += bytes(data[:take])
+                return take
+
+        writer = ShortWriter()
+        output = tty_module.TerminalOutput(writer)
+        output.write(b"0123456789abcdef")
+        self.assertEqual(writer.data, b"0123456789abcdef")
+        self.assertFalse(output.failed)
+
     def test_write_empty_is_a_noop(self):
         recorder = RecordingFile()
         output = tty_module.TerminalOutput(recorder)

@@ -152,7 +152,18 @@ class TerminalOutput:
             except (OSError, ValueError):
                 self.capture = None
         try:
-            self.fileobj.write(data)
+            # a raw (unbuffered) writer may write less than the whole buffer
+            # (a signal arriving mid-write does exactly that): anything short
+            # of a full write would truncate an escape sequence, so loop.
+            # buffered writers return the full length (or `None`):
+            view = memoryview(data)
+            while view:
+                written = self.fileobj.write(view)
+                if written is None or written >= len(view):
+                    break
+                if written <= 0:
+                    raise OSError("terminal write returned %r" % (written, ))
+                view = view[written:]
         except (OSError, ValueError) as e:
             self.failed = True
             log("write(%i bytes)", len(data), exc_info=True)

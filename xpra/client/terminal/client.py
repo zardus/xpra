@@ -67,10 +67,14 @@ SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
 # 0 disables it:
 TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 750)
 # `a=f` frame edits update damaged regions without re-sending the whole image,
-# which both saves a lot of bandwidth and avoids replacing the visible image
-# on every update - essential for applications which redraw constantly:
+# but kitty (0.45) drops chunked frame edits which directly follow another
+# chunked graphics command: the edit is accepted without an error response and
+# never rendered.  This is deterministic: replaying a captured client stream
+# into kitty reproduces it, and inserting delays between the commands makes it
+# render correctly.  Full image retransmits are unaffected (and they no longer
+# flicker, see `BACK_IMAGE_OFFSET`), so they are the default:
 # -1 = detect support with a probe and use them, 0 = never, 1 = always:
-FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", -1)
+FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", 0)
 # how long to wait for the terminal to answer the frame edit probe, in milliseconds:
 FRAME_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_FRAME_PROBE_TIMEOUT", 1000)
 # while the terminal is in graphics mode, reroute the process file descriptors 1 and 2

@@ -459,20 +459,10 @@ class TerminalClientTest(unittest.TestCase):
     ######################################################################
     # the kitty graphics protocol probe
 
-    def test_frame_edit_probe_is_the_default(self):
-        # frame edits save bandwidth and avoid replacing the visible image on
-        # every update, so out of the box the client probes for support:
-        client = self.make_client()
-        buf = self.make_output(client)
-        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
-        self.assertTrue(client.graphics_ok)
-        self.assertTrue(client.frame_probe_sent)
-        self.assertIn(b"a=f,i=%i" % terminal_client.PROBE_IMAGE_ID, buf.getvalue())
-
-    def test_full_retransmits_can_be_forced(self):
-        saved = terminal_client.FRAME_EDITS
-        terminal_client.FRAME_EDITS = 0
-        self.addCleanup(setattr, terminal_client, "FRAME_EDITS", saved)
+    def test_full_retransmits_are_the_default(self):
+        # kitty drops chunked `a=f` frame edits which directly follow another
+        # chunked graphics command (accepted, never rendered), so out of the
+        # box every update re-sends the whole image:
         client = self.make_client()
         buf = self.make_output(client)
         client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
