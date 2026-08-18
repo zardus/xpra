@@ -120,7 +120,11 @@ class ScreenDesktopModel(DesktopModelBase):
             if ow == rw and oh == rh:
                 return
             with xsync:
-                if RandR.is_dummy16() and (rw, rh) not in RandR.get_xrr_screen_sizes():
+                if (rw, rh) not in RandR.get_xrr_screen_sizes():
+                    # the mode must exist before it can be set: this is not
+                    # specific to the dummy driver, Xvfb needs it too
+                    # (the seamless server already does this - see
+                    # `do_get_best_screen_size` in `xpra.x11.subsystem.display`):
                     RandR.add_screen_size(rw, rh)
             with xsync:
                 if not RandR.set_screen_size(rw, rh):
