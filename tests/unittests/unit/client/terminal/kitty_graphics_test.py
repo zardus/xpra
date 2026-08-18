@@ -238,6 +238,31 @@ class TestChunking(unittest.TestCase):
 
 
 @unittest.skipIf(graphics is None, "the terminal client graphics module is not available")
+class TestSharedMemory(unittest.TestCase):
+
+    def test_transmit_shm(self):
+        escapes = split_escapes(graphics.transmit_shm(7, 1908, 1152, "/xpra-terminal-1-2"))
+        self.assertEqual(len(escapes), 1)
+        control, payload = escapes[0]
+        self.assertEqual(control, "a=t,q=2,i=7,f=32,s=1908,v=1152,t=s,S=%i" % (1908 * 1152 * 4))
+        self.assertEqual(payload, b64encode(b"/xpra-terminal-1-2"))
+
+    def test_patch_shm(self):
+        escapes = split_escapes(graphics.patch_shm(7, 10, 20, 640, 480, "/xpra-terminal-1-3"))
+        self.assertEqual(len(escapes), 1)
+        control, payload = escapes[0]
+        self.assertEqual(control, "a=f,q=2,i=7,r=1,x=10,y=20,s=640,v=480,X=1,t=s,S=%i" % (640 * 480 * 4))
+        self.assertEqual(payload, b64encode(b"/xpra-terminal-1-3"))
+
+    def test_probe_shm_is_not_quieted(self):
+        escapes = split_escapes(graphics.probe_shm(9, "/xpra-terminal-1-1"))
+        self.assertEqual(len(escapes), 1)
+        control, payload = escapes[0]
+        self.assertEqual(control, "a=q,i=9,f=32,s=1,v=1,t=s,S=4")
+        self.assertNotIn("q=2", control)
+        self.assertEqual(payload, b64encode(b"/xpra-terminal-1-1"))
+
+
 class TestPlace(unittest.TestCase):
 
     def test_golden(self):

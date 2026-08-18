@@ -32,6 +32,7 @@ from xpra.client.terminal.input import (
 )
 from xpra.client.terminal.keys import make_key_event, modifier_names, MODIFIER_CODE_BITS
 from xpra.client.terminal.backing import to_rgba
+from xpra.client.terminal.shm import ShmWriter
 from xpra.client.terminal.window import cell_position, BACK_IMAGE_OFFSET, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
 from xpra.log import Logger, setloghandler
 
@@ -83,11 +84,22 @@ FRAME_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_FRAME_PROBE_TIMEOUT", 10
 # graphics command it is parsing - the update is silently dropped:
 SEAL_STDIO: Final[bool] = envbool("XPRA_TERMINAL_SEAL_STDIO", True)
 
+# transfer the pixel data through POSIX shared memory (`t=s`) instead of
+# base64 escape sequences when the terminal runs on this machine: no chunking,
+# no base64 overhead, and damaged regions can be patched with `a=f` frame
+# edits safely (the chunked form of those is mishandled by kitty, see
+# `FRAME_EDITS`): -1 = detect with a probe and use it, 0 = never, 1 = always:
+SHM: Final[int] = envint("XPRA_TERMINAL_SHM", -1)
+# how long to wait for the terminal to answer the shared memory probe, in milliseconds:
+SHM_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_SHM_PROBE_TIMEOUT", 1000)
+
 # the image and placement ids we use for things which are not windows:
 PROBE_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 1
 # the alternate cursor image id: new cursor shapes alternate between the two
 # ids so the new image can be placed before the old one is deleted:
 CURSOR_BACK_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 2
+# the query probing for shared memory transmission support:
+PROBE_SHM_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 3
 CURSOR_PLACEMENT_ID: Final[int] = 1
 
 BELL: Final[bytes] = b"\x07"
@@ -200,6 +212,11 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.frame_edits: bool = FRAME_EDITS > 0
         self.frame_probe_sent: bool = False
         self.frame_probe_timer: int = 0
+        # whether pixels are transferred through shared memory (see `SHM`):
+        self.shm_ok: bool = False
+        self.shm_writer: ShmWriter | None = None
+        self.shm_probe_sent: bool = False
+        self.shm_probe_timer: int = 0
         self.log_handler = None
         self.saved_log_handlers: list | None = None
         # while sealed: (private tty copy for the renderer, saved fd 1, saved fd 2)
@@ -400,6 +417,12 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.cancel_probe_timer()
         self.cancel_frame_probe_timer()
         self.frame_probe_sent = False
+        self.cancel_shm_probe_timer()
+        self.shm_probe_sent = False
+        self.shm_ok = False
+        if writer := self.shm_writer:
+            self.shm_writer = None
+            writer.cleanup()
         output = self.terminal_output
         self.terminal_output = None
         if output is not None:
@@ -1068,6 +1091,9 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     # kitty graphics protocol support
 
     def handle_graphics_response(self, response: GraphicsResponse) -> None:
+        if response.image_id == PROBE_SHM_IMAGE_ID:
+            self.handle_shm_probe_response(response)
+            return
         if response.image_id != PROBE_IMAGE_ID:
             log("ignoring graphics response for image %i: %s", response.image_id, response.message)
             return
@@ -1079,6 +1105,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             log("the terminal supports the kitty graphics protocol")
             self.graphics_ok = True
             self.probe_frame_edits()
+            self.probe_shm_support()
             # everything mapped before the probe answered has not been drawn yet:
             for window in self.get_windows():
                 window.refresh_placement()
@@ -1117,6 +1144,76 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             log.info(" damaged regions will be updated by re-sending the whole image")
             self.free_probe_image()
         return False
+
+    def probe_shm_support(self) -> None:
+        """
+        Find out if the terminal can read POSIX shared memory objects we
+        create - only a terminal running on this machine can (see `SHM`).
+        """
+        output = self.terminal_output
+        if output is None:
+            return
+        if SHM >= 0:
+            self.shm_ok = SHM > 0
+            if self.shm_ok:
+                self.shm_writer = ShmWriter()
+            return
+        if not ShmWriter.available():
+            log("no shared memory directory, using direct transmission")
+            return
+        writer = ShmWriter()
+        name = writer.write(b"\x00\x00\x00\x00")
+        if not name:
+            return
+        self.shm_writer = writer
+        self.shm_probe_sent = True
+        output.write(graphics.probe_shm(PROBE_SHM_IMAGE_ID, name))
+        output.flush()
+        self.shm_probe_timer = self.timeout_add(SHM_PROBE_TIMEOUT, self.shm_probe_timeout)
+
+    def handle_shm_probe_response(self, response: GraphicsResponse) -> None:
+        if not self.shm_probe_sent:
+            log("ignoring shm probe response: %s", response.message)
+            return
+        self.shm_probe_sent = False
+        self.cancel_shm_probe_timer()
+        self.shm_ok = response.ok
+        if response.ok:
+            log.info("pixels are transferred through shared memory")
+        else:
+            log("the terminal cannot read our shared memory: %s", response.message or "rejected")
+            if writer := self.shm_writer:
+                self.shm_writer = None
+                writer.cleanup()
+
+    def shm_probe_timeout(self) -> bool:
+        self.shm_probe_timer = 0
+        if self.shm_probe_sent:
+            self.shm_probe_sent = False
+            self.shm_ok = False
+            log("the terminal did not answer the shared memory query")
+            if writer := self.shm_writer:
+                self.shm_writer = None
+                writer.cleanup()
+        return False
+
+    def cancel_shm_probe_timer(self) -> None:
+        if st := self.shm_probe_timer:
+            self.shm_probe_timer = 0
+            self.source_remove(st)
+
+    def shm_transfer(self, pixels) -> str:
+        """
+        Store the pixels in a shared memory object for the terminal to read,
+        returns the object name, or an empty string when shared memory is not
+        in use (the caller then sends the pixels directly).
+        """
+        if not self.shm_ok:
+            return ""
+        writer = self.shm_writer
+        if writer is None:
+            return ""
+        return writer.write(pixels)
 
     def free_probe_image(self) -> None:
         if output := self.terminal_output:

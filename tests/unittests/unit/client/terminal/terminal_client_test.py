@@ -459,6 +459,66 @@ class TerminalClientTest(unittest.TestCase):
     ######################################################################
     # the kitty graphics protocol probe
 
+    def _pin_shm(self, value: int):
+        saved = terminal_client.SHM
+        terminal_client.SHM = value
+        self.addCleanup(setattr, terminal_client, "SHM", saved)
+
+    def test_shm_probe_follows_the_graphics_probe(self):
+        from xpra.client.terminal.shm import ShmWriter
+        if not ShmWriter.available():
+            self.skipTest("no writable shared memory directory")
+        self._pin_shm(-1)
+        client = self.make_client()
+        buf = self.make_output(client)
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
+        self.assertTrue(client.shm_probe_sent)
+        self.assertFalse(client.shm_ok)
+        data = buf.getvalue()
+        self.assertIn(b"a=q,i=%i,f=32,s=1,v=1,t=s,S=4" % terminal_client.PROBE_SHM_IMAGE_ID, data)
+        # the probe object holds the single test pixel:
+        writer = client.shm_writer
+        self.assertEqual(len(writer.pending), 1)
+        path = writer.path(writer.pending[0])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"\x00\x00\x00\x00")
+        # the terminal read (and unlinked) the object and answers OK:
+        os.unlink(path)
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_SHM_IMAGE_ID, True, "OK"))
+        self.assertTrue(client.shm_ok)
+        self.assertFalse(client.shm_probe_sent)
+        # pixels now go through shared memory:
+        name = client.shm_transfer(b"\x01\x02\x03\x04")
+        self.assertTrue(name)
+        with open(writer.path(name), "rb") as f:
+            self.assertEqual(f.read(), b"\x01\x02\x03\x04")
+
+    def test_shm_probe_rejection_cleans_up(self):
+        from xpra.client.terminal.shm import ShmWriter
+        if not ShmWriter.available():
+            self.skipTest("no writable shared memory directory")
+        self._pin_shm(-1)
+        client = self.make_client()
+        self.make_output(client)
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
+        writer = client.shm_writer
+        path = writer.path(writer.pending[0])
+        # a terminal on another machine cannot open our shared memory:
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_SHM_IMAGE_ID, False, "EBADF"))
+        self.assertFalse(client.shm_ok)
+        self.assertIsNone(client.shm_writer)
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(client.shm_transfer(b"data"), "")
+
+    def test_shm_can_be_forced_off(self):
+        self._pin_shm(0)
+        client = self.make_client()
+        buf = self.make_output(client)
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
+        self.assertFalse(client.shm_probe_sent)
+        self.assertFalse(client.shm_ok)
+        self.assertNotIn(b"t=s", buf.getvalue())
+
     def test_full_retransmits_are_the_default(self):
         # kitty drops chunked `a=f` frame edits which directly follow another
         # chunked graphics command (accepted, never rendered), so out of the

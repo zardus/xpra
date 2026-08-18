@@ -135,6 +135,17 @@ class ClientWindow(ClientWindowBase):
         """ whether the terminal can patch a damaged region with an `a=f` frame edit """
         return bool(getattr(self._client, "frame_edits", True))
 
+    def shm_supported(self) -> bool:
+        """ whether the pixels travel through shared memory (see `shm_transfer`) """
+        return bool(getattr(self._client, "shm_ok", False))
+
+    def shm_transfer(self, pixels) -> str:
+        """ store the pixels in a shared memory object, empty string when not in use """
+        shm_transfer = getattr(self._client, "shm_transfer", None)
+        if not callable(shm_transfer):
+            return ""
+        return shm_transfer(pixels)
+
     def window_z(self) -> int:
         """ the kitty `z` index the client assigned to this window """
         window_z = getattr(self._client, "window_z", None)
@@ -158,7 +169,12 @@ class ClientWindow(ClientWindowBase):
             return False
         old_id = self._image_id
         new_id = self.wid + BACK_IMAGE_OFFSET if old_id == self.wid else self.wid
-        output.write(graphics.transmit(new_id, bw, bh, bytes(backing.pixels)))
+        pixels = bytes(backing.pixels)
+        name = self.shm_transfer(pixels)
+        if name:
+            output.write(graphics.transmit_shm(new_id, bw, bh, name))
+        else:
+            output.write(graphics.transmit(new_id, bw, bh, pixels))
         self._image_id = new_id
         self._transmitted_serial = backing.buffer_serial
         # the whole image has just been sent, nothing is pending:
@@ -245,9 +261,11 @@ class ClientWindow(ClientWindowBase):
         backing = self._backing
         if output is None or backing is None or not self._mapped or self._frozen:
             return
-        if self._transmitted_serial != backing.buffer_serial or not self.frame_edits_supported():
+        shm = self.shm_supported()
+        if self._transmitted_serial != backing.buffer_serial or not (shm or self.frame_edits_supported()):
             # the buffer was (re)allocated so the terminal has nothing to patch,
-            # or this terminal cannot patch at all (no `a=f` frame edit support):
+            # or this terminal cannot patch at all (no `a=f` frame edit support
+            # and no shared memory to patch through):
             if self.transmit_image(output):
                 output.flush()
             return
@@ -257,7 +275,18 @@ class ClientWindow(ClientWindowBase):
             cx, cy, cw, ch = backing.clip(x, y, w, h)
             if cw <= 0 or ch <= 0:
                 continue
-            data += graphics.patch(self._image_id, cx, cy, cw, ch, backing.pixels_for(cx, cy, cw, ch))
+            pixels = backing.pixels_for(cx, cy, cw, ch)
+            if shm:
+                name = self.shm_transfer(pixels)
+                if not name:
+                    # shared memory just failed on us: re-send the whole image
+                    # instead, the direct frame edit path may not be supported
+                    if self.transmit_image(output):
+                        output.flush()
+                    return
+                data += graphics.patch_shm(self._image_id, cx, cy, cw, ch, name)
+            else:
+                data += graphics.patch(self._image_id, cx, cy, cw, ch, pixels)
         drawlog("emit_updates(%s) %i bytes", rects, len(data))
         if data:
             output.write(data)

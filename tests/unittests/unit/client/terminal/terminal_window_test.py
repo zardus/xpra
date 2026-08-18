@@ -381,6 +381,55 @@ class TerminalWindowTest(unittest.TestCase):
         self.assertEqual(actions(commands), ["t", "p", "d"])
         self.assertNotIn("f", actions(commands))
 
+    def test_shm_transmit_and_patches(self):
+        # with shared memory, transmits carry only the object name and
+        # damaged regions are patched with unchunked `t=s` frame edits:
+        client, window = self.make_window()
+        client.shm_ok = True
+        transfers = []
+
+        def shm_transfer(pixels) -> str:
+            transfers.append(bytes(pixels))
+            return f"/fake-shm-{len(transfers)}"
+
+        client.shm_transfer = shm_transfer
+        client.frame_edits = False
+        window.show_all()
+        commands = client.commands()
+        self.assertEqual(actions(commands), ["t", "p"])
+        transmit = graphics_keys(commands, "t")[0]
+        self.assertEqual(transmit["t"], "s")
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(len(transfers[0]), 64 * 32 * 4)
+        calls = self.paint(window, 2, 3, 4, 4)
+        self.assertTrue(calls[0][0])
+        commands = client.commands()
+        # patched through shared memory, no retransmit needed:
+        self.assertEqual(actions(commands), ["f"])
+        patch = graphics_keys(commands, "f")[0]
+        self.assertEqual(patch["t"], "s")
+        self.assertEqual((patch["x"], patch["y"], patch["s"], patch["v"]), ("2", "3", "4", "4"))
+        self.assertEqual(len(transfers), 2)
+        self.assertEqual(len(transfers[1]), 4 * 4 * 4)
+
+    def test_shm_failure_falls_back_to_a_retransmit(self):
+        client, window = self.make_window()
+        client.shm_ok = True
+        client.shm_transfer = lambda pixels: "/fake-shm"
+        window.show_all()
+        client.drain()
+        client.packets = []
+        # shared memory just failed (e.g. it filled up):
+        client.shm_transfer = lambda pixels: ""
+        calls = self.paint(window, 2, 3, 4, 4)
+        self.assertTrue(calls[0][0])
+        commands = client.commands()
+        # the whole image is re-sent directly instead:
+        self.assertEqual(actions(commands), ["t", "p", "d"])
+        self.assertNotIn("f", actions(commands))
+        transmit = graphics_keys(commands, "t")[0]
+        self.assertNotEqual(transmit.get("t"), "s")
+
     def test_full_retransmits_swap_image_ids(self):
         # re-sending under the same image id would delete the visible image
         # (and its placement) before the new one arrives, flickering on every

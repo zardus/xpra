@@ -138,6 +138,45 @@ def patch(image_id: int, x: int, y: int, width: int, height: int, pixels: bytes,
     return chunked(control, payload, cont=FRAME_ACTION)
 
 
+def transmit_shm(image_id: int, width: int, height: int, name: str, alpha=True) -> bytes:
+    """
+    Transmit a whole image through a POSIX shared memory object (`t=s`):
+    the payload is only the object's name, the raw pixels are read (and the
+    object unlinked) by the terminal.  No chunking, no base64 pixel data.
+    """
+    _check_u32("image id", image_id)
+    size = width * height * (4 if alpha else 3)
+    control = f"a=t,q=2,i={image_id},f={32 if alpha else 24},s={width},v={height},t=s,S={size}"
+    log("transmit_shm(%i, %i, %i, %r)", image_id, width, height, name)
+    return escape(control, b64encode(name.encode("ascii")))
+
+
+def patch_shm(image_id: int, x: int, y: int, width: int, height: int, name: str) -> bytes:
+    """
+    A frame edit (`a=f`, see `patch`) reading its pixels from a shared memory
+    object: a single small escape sequence regardless of the region size,
+    which also avoids the chunked frame edits some terminals mishandle.
+    """
+    _check_u32("image id", image_id)
+    size = width * height * 4
+    control = f"{FRAME_ACTION},q=2,i={image_id},r=1,x={x},y={y},s={width},v={height},X=1,t=s,S={size}"
+    log("patch_shm(%i, %i, %i, %i, %i, %r)", image_id, x, y, width, height, name)
+    return escape(control, b64encode(name.encode("ascii")))
+
+
+def probe_shm(image_id: int, name: str) -> bytes:
+    """
+    Query (`a=q`) with a shared memory transmission: the terminal only answers
+    `OK` when it could actually open and map our object, which is exactly the
+    local-terminal detection needed before using `t=s` (a terminal on the far
+    side of an ssh connection cannot reach this machine's shared memory).
+    Not quieted, since we want the terminal's reply.
+    The object must hold a single RGBA pixel (4 bytes).
+    """
+    _check_u32("image id", image_id)
+    return escape(f"a=q,i={image_id},f=32,s=1,v=1,t=s,S=4", b64encode(name.encode("ascii")))
+
+
 def delete_placement(image_id: int, placement_id: int) -> bytes:
     """ remove a single placement (`d=i`, lowercase: the image data is kept) """
     _check_u32("image id", image_id)
