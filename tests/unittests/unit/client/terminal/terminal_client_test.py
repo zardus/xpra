@@ -459,9 +459,20 @@ class TerminalClientTest(unittest.TestCase):
     ######################################################################
     # the kitty graphics protocol probe
 
-    def test_full_retransmits_are_the_default(self):
-        # frame edits have proven unreliable on some terminals (kitty on Wayland),
-        # so out of the box every update re-sends the whole image:
+    def test_frame_edit_probe_is_the_default(self):
+        # frame edits save bandwidth and avoid replacing the visible image on
+        # every update, so out of the box the client probes for support:
+        client = self.make_client()
+        buf = self.make_output(client)
+        client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
+        self.assertTrue(client.graphics_ok)
+        self.assertTrue(client.frame_probe_sent)
+        self.assertIn(b"a=f,i=%i" % terminal_client.PROBE_IMAGE_ID, buf.getvalue())
+
+    def test_full_retransmits_can_be_forced(self):
+        saved = terminal_client.FRAME_EDITS
+        terminal_client.FRAME_EDITS = 0
+        self.addCleanup(setattr, terminal_client, "FRAME_EDITS", saved)
         client = self.make_client()
         buf = self.make_output(client)
         client.handle_graphics_response(GraphicsResponse(terminal_client.PROBE_IMAGE_ID, True, "OK"))
@@ -479,7 +490,7 @@ class TerminalClientTest(unittest.TestCase):
         self.addCleanup(setattr, terminal_client, "FRAME_EDITS", saved)
 
     def test_graphics_probe_accepted(self):
-        # the auto-detection probe is no longer the default, turn it back on:
+        # pin the probe mode, regardless of the XPRA_TERMINAL_FRAME_EDITS environment:
         self._force_frame_edit_probe()
         client = self.make_client()
         buf = self.make_output(client)
@@ -506,7 +517,7 @@ class TerminalClientTest(unittest.TestCase):
         self.assertIn(b"a=d,d=I", buf.getvalue())
 
     def test_frame_edits_rejected(self):
-        # the auto-detection probe is no longer the default, turn it back on:
+        # pin the probe mode, regardless of the XPRA_TERMINAL_FRAME_EDITS environment:
         self._force_frame_edit_probe()
         client = self.make_client()
         buf = self.make_output(client)
@@ -520,7 +531,7 @@ class TerminalClientTest(unittest.TestCase):
         self.assertIn(b"a=d,d=I", buf.getvalue())
 
     def test_frame_edit_probe_timeout(self):
-        # the auto-detection probe is no longer the default, turn it back on:
+        # pin the probe mode, regardless of the XPRA_TERMINAL_FRAME_EDITS environment:
         self._force_frame_edit_probe()
         client = self.make_client()
         self.make_output(client)
@@ -961,6 +972,28 @@ class TerminalClientTest(unittest.TestCase):
         # the image is already in the terminal, only the placement moves:
         self.assertNotIn(b"a=t", data)
         self.assertIn(b"\x1b[5;20H", data)
+
+    def test_new_cursor_shapes_swap_image_ids(self):
+        # a new shape must be placed before the old image is deleted, or the
+        # pointer blinks on every shape change (retransmitting under a single
+        # id deletes the visible image and its placement first):
+        client = self.make_client()
+        buf = self.make_output(client)
+        client.set_windows_cursor((), self.cursor_data())
+        self.assertEqual(client._cursor_image_id, graphics.CURSOR_IMAGE_ID)
+        buf.seek(0)
+        buf.truncate()
+        new_shape = list(self.cursor_data())
+        new_shape[7] = int(new_shape[7]) + 1
+        client.set_windows_cursor((), tuple(new_shape))
+        data = buf.getvalue()
+        back_id = terminal_client.CURSOR_BACK_IMAGE_ID
+        self.assertEqual(client._cursor_image_id, back_id)
+        transmit = data.index(b"a=t,q=2,i=%i" % back_id)
+        place = data.index(b"a=p,q=2,i=%i" % back_id)
+        delete = data.index(b"a=d,d=I,i=%i" % graphics.CURSOR_IMAGE_ID)
+        self.assertLess(transmit, place)
+        self.assertLess(place, delete)
 
     def test_empty_cursor_removes_the_placement(self):
         client = self.make_client()

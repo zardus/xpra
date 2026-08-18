@@ -378,8 +378,34 @@ class TerminalWindowTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0][0])
         commands = client.commands()
-        self.assertEqual(actions(commands), ["t", "p"])
+        self.assertEqual(actions(commands), ["t", "p", "d"])
         self.assertNotIn("f", actions(commands))
+
+    def test_full_retransmits_swap_image_ids(self):
+        # re-sending under the same image id would delete the visible image
+        # (and its placement) before the new one arrives, flickering on every
+        # update: retransmits must place the new image before the old one is
+        # deleted, alternating between the two image ids of this window:
+        client, window = self.make_window()
+        client.frame_edits = False
+        window.show_all()
+        commands = client.commands()
+        self.assertEqual(actions(commands), ["t", "p"])
+        first = graphics_keys(commands, "t")[0]["i"]
+        self.paint(window)
+        commands = client.commands()
+        self.assertEqual(actions(commands), ["t", "p", "d"])
+        second = graphics_keys(commands, "t")[0]["i"]
+        self.assertNotEqual(first, second)
+        self.assertEqual(graphics_keys(commands, "p")[0]["i"], second)
+        delete = graphics_keys(commands, "d")[0]
+        self.assertEqual(delete["i"], first)
+        self.assertEqual(delete["d"], "I")
+        # the next retransmit swaps back and deletes the other one:
+        self.paint(window)
+        commands = client.commands()
+        self.assertEqual(graphics_keys(commands, "t")[0]["i"], first)
+        self.assertEqual(graphics_keys(commands, "d")[0]["i"], second)
 
     def test_draw_region_flush_defers_the_patch(self):
         client, window = self.make_window()
@@ -456,7 +482,9 @@ class TerminalWindowTest(unittest.TestCase):
         client.drain()
         window._frozen = False
         window.redraw()
-        self.assertEqual(actions(client.commands()), ["t", "p"])
+        # the reallocated buffer is transmitted under the alternate image id,
+        # placed, and only then is the old image deleted:
+        self.assertEqual(actions(client.commands()), ["t", "p", "d"])
 
     def test_paint_reaches_the_backing(self):
         client, window = self.make_window()
@@ -505,7 +533,7 @@ class TerminalWindowTest(unittest.TestCase):
         self.assertEqual(window._backing.render_size, (100, 50))
         self.assertGreater(window._backing.buffer_serial, serial)
         commands = client.commands()
-        self.assertEqual(actions(commands), ["t", "p"])
+        self.assertEqual(actions(commands), ["t", "p", "d"])
         transmit = graphics_keys(commands, "t")[0]
         self.assertEqual((transmit["s"], transmit["v"]), ("100", "50"))
         config = client.last_packet(WINDOW_CONFIGURE)[2]

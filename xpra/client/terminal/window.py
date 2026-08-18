@@ -24,8 +24,16 @@ drawlog = Logger("paint", "terminal")
 DEFAULT_CELL_WIDTH: int = envint("XPRA_TERMINAL_CELL_WIDTH", 10)
 DEFAULT_CELL_HEIGHT: int = envint("XPRA_TERMINAL_CELL_HEIGHT", 20)
 
-# each window uses a single placement, the image id is the window id:
+# each window uses a single placement, the image id is the window id -
+# or the window id plus this offset: full image retransmits alternate
+# between the two ids so that the new image can be placed before the old
+# one is deleted.  Retransmitting under a single id would delete the
+# visible image (and its placement) first, and the screen background then
+# shows through until the new image arrives and is placed: with an
+# application that redraws constantly, that is a full-screen flicker on
+# every update:
 PLACEMENT_ID: Final[int] = 1
+BACK_IMAGE_OFFSET: Final[int] = 1 << 27
 
 
 def cell_position(x: int, y: int, cell_width: int, cell_height: int,
@@ -62,6 +70,9 @@ class ClientWindow(ClientWindowBase):
         self._placed = False
         # the buffer generation we last transmitted, 0 means "nothing transmitted yet":
         self._transmitted_serial = 0
+        # the image id the terminal currently holds for this window,
+        # 0 means "nothing transmitted yet" (see `BACK_IMAGE_OFFSET`):
+        self._image_id = 0
         self._resize_counter = 0
         self._window_state: dict[str, Any] = {}
         self._transient_for = 0
@@ -138,18 +149,25 @@ class ClientWindow(ClientWindowBase):
     # terminal output
 
     def transmit_image(self, output) -> bool:
-        """ send the whole backing buffer as a new image, then place it """
+        """ send the whole backing buffer as a new image, place it, then drop the old image """
         backing = self._backing
         if backing is None:
             return False
         bw, bh = backing.size
         if bw <= 0 or bh <= 0:
             return False
-        output.write(graphics.transmit(self.wid, bw, bh, bytes(backing.pixels)))
+        old_id = self._image_id
+        new_id = self.wid + BACK_IMAGE_OFFSET if old_id == self.wid else self.wid
+        output.write(graphics.transmit(new_id, bw, bh, bytes(backing.pixels)))
+        self._image_id = new_id
         self._transmitted_serial = backing.buffer_serial
         # the whole image has just been sent, nothing is pending:
         backing.get_damage()
         self.place_image(output)
+        if old_id:
+            # only deleted after the new image was placed on top of it,
+            # so the window never disappears between two updates:
+            output.write(graphics.delete_image(old_id))
         return True
 
     def place_image(self, output) -> None:
@@ -158,14 +176,14 @@ class ClientWindow(ClientWindowBase):
         px, py = self._pos
         row, col, x_off, y_off = cell_position(px, py, cell_width, cell_height, max_width, max_height)
         geomlog("place_image() window %#x at %s -> cell %s offset %s", self.wid, (px, py), (row, col), (x_off, y_off))
-        output.write(graphics.place(self.wid, PLACEMENT_ID, row, col, x_off, y_off, self.window_z()))
+        output.write(graphics.place(self._image_id, PLACEMENT_ID, row, col, x_off, y_off, self.window_z()))
         self._placed = True
 
     def remove_placement(self, output) -> None:
         if not self._placed:
             return
         self._placed = False
-        output.write(graphics.delete_placement(self.wid, PLACEMENT_ID))
+        output.write(graphics.delete_placement(self._image_id, PLACEMENT_ID))
 
     def refresh_placement(self) -> None:
         """
@@ -239,7 +257,7 @@ class ClientWindow(ClientWindowBase):
             cx, cy, cw, ch = backing.clip(x, y, w, h)
             if cw <= 0 or ch <= 0:
                 continue
-            data += graphics.patch(self.wid, cx, cy, cw, ch, backing.pixels_for(cx, cy, cw, ch))
+            data += graphics.patch(self._image_id, cx, cy, cw, ch, backing.pixels_for(cx, cy, cw, ch))
         drawlog("emit_updates(%s) %i bytes", rects, len(data))
         if data:
             output.write(data)
@@ -299,11 +317,12 @@ class ClientWindow(ClientWindowBase):
         output = self.terminal_output()
         if output is not None:
             self.remove_placement(output)
-            if self._transmitted_serial:
-                output.write(graphics.delete_image(self.wid))
+            if self._image_id:
+                output.write(graphics.delete_image(self._image_id))
             output.flush()
         self._mapped = False
         self._transmitted_serial = 0
+        self._image_id = 0
         super().destroy()
 
     ######################################################################

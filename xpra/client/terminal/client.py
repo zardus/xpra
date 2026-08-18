@@ -32,7 +32,7 @@ from xpra.client.terminal.input import (
 )
 from xpra.client.terminal.keys import make_key_event, modifier_names, MODIFIER_CODE_BITS
 from xpra.client.terminal.backing import to_rgba
-from xpra.client.terminal.window import cell_position, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
+from xpra.client.terminal.window import cell_position, BACK_IMAGE_OFFSET, DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT
 from xpra.log import Logger, setloghandler
 
 log = Logger("client", "terminal")
@@ -67,11 +67,10 @@ SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
 # 0 disables it:
 TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 750)
 # `a=f` frame edits update damaged regions without re-sending the whole image,
-# but their rendering has proven unreliable on some terminal/display combinations
-# (observed: kitty on Wayland dropping edits under rapid updates, while the same
-# kitty version on X11 renders them correctly), so full retransmits are the
-# default: -1 = detect support with a probe and use them, 0 = never, 1 = always:
-FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", 0)
+# which both saves a lot of bandwidth and avoids replacing the visible image
+# on every update - essential for applications which redraw constantly:
+# -1 = detect support with a probe and use them, 0 = never, 1 = always:
+FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", -1)
 # how long to wait for the terminal to answer the frame edit probe, in milliseconds:
 FRAME_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_FRAME_PROBE_TIMEOUT", 1000)
 # while the terminal is in graphics mode, reroute the process file descriptors 1 and 2
@@ -82,6 +81,9 @@ SEAL_STDIO: Final[bool] = envbool("XPRA_TERMINAL_SEAL_STDIO", True)
 
 # the image and placement ids we use for things which are not windows:
 PROBE_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 1
+# the alternate cursor image id: new cursor shapes alternate between the two
+# ids so the new image can be placed before the old one is deleted:
+CURSOR_BACK_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 2
 CURSOR_PLACEMENT_ID: Final[int] = 1
 
 BELL: Final[bytes] = b"\x07"
@@ -223,6 +225,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         # cursor state:
         self._cursor_data: tuple = ()
         self._cursor_serial: int = 0
+        self._cursor_image_id: int = 0
         self._cursor_placed: bool = False
         self.init_terminal_size()
         # the keyboard helper must be replaced before the `keyboard` subsystem
@@ -407,11 +410,14 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
     def delete_images(self, output: TerminalOutput) -> None:
         """ free every kitty image we uploaded - best effort, the terminal may already be gone """
         for wid in tuple(self._zorder.keys()):
+            # either of the window's two image ids may be the live one:
             output.write(graphics.delete_image(wid))
+            output.write(graphics.delete_image(wid + BACK_IMAGE_OFFSET))
         if self._cursor_serial:
             self._cursor_serial = 0
             self._cursor_placed = False
-            output.write(graphics.delete_image(graphics.CURSOR_IMAGE_ID))
+            output.write(graphics.delete_image(self._cursor_image_id or graphics.CURSOR_IMAGE_ID))
+            self._cursor_image_id = 0
         if self.graphics_ok:
             output.write(graphics.delete_image(PROBE_IMAGE_ID))
         output.flush()
@@ -1016,20 +1022,30 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
             if width <= 0 or height <= 0:
                 self.remove_cursor(output)
                 return
+            old_id = 0
             if serial != self._cursor_serial:
+                # a new cursor shape: transmitted under the alternate image id and
+                # placed before the old image is deleted, so the pointer never
+                # blinks (retransmitting under one id deletes the visible image
+                # and its placement first) - same swap as the window images:
+                old_id = self._cursor_image_id
+                new_id = CURSOR_BACK_IMAGE_ID if old_id == graphics.CURSOR_IMAGE_ID else graphics.CURSOR_IMAGE_ID
                 # the cursor pixels are RGBA on the wire (see `CursorClient` and the
                 # `raw` cursor images the X11 and Wayland servers produce):
-                output.write(graphics.transmit(graphics.CURSOR_IMAGE_ID, width, height,
+                output.write(graphics.transmit(new_id, width, height,
                                                to_rgba("RGBA", pixels, width, height, width * 4)))
+                self._cursor_image_id = new_id
                 self._cursor_serial = serial
             cell_width, cell_height = self.cell_size()
             max_width, max_height = self.terminal_pixel_size()
             px, py = self._pointer_pos
             row, col, x_off, y_off = cell_position(px - xhot, py - yhot, cell_width, cell_height,
                                                    max_width, max_height)
-            output.write(graphics.place(graphics.CURSOR_IMAGE_ID, CURSOR_PLACEMENT_ID,
+            output.write(graphics.place(self._cursor_image_id, CURSOR_PLACEMENT_ID,
                                         row, col, x_off, y_off, graphics.CURSOR_Z))
             self._cursor_placed = True
+            if old_id:
+                output.write(graphics.delete_image(old_id))
             output.flush()
         except (TypeError, ValueError) as e:
             cursorlog("update_cursor()", exc_info=True)
@@ -1041,7 +1057,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         if not self._cursor_placed:
             return
         self._cursor_placed = False
-        output.write(graphics.delete_placement(graphics.CURSOR_IMAGE_ID, CURSOR_PLACEMENT_ID))
+        output.write(graphics.delete_placement(self._cursor_image_id, CURSOR_PLACEMENT_ID))
         output.flush()
 
     ######################################################################
