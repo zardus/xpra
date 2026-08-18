@@ -340,6 +340,22 @@ class TerminalClientTest(unittest.TestCase):
         self.assertFalse(opts.system_tray)
         self.assertEqual(client.headerbar, "no")
 
+    def test_keyboard_sync_is_turned_off_before_the_subsystems_are_initialized(self):
+        # with sync enabled the server holds each key down between our press and
+        # release packets, and the rollover of ordinary fast typing then collapses
+        # repeated letters and mispairs the releases:
+        client = self.make_client()
+        opts = AdHocStruct()
+        opts.keyboard_sync = True
+        seen = []
+        saved = ui_client_base.UIXpraClient.init
+        ui_client_base.UIXpraClient.init = lambda self, o: seen.append(o.keyboard_sync)
+        try:
+            client.init(opts)
+        finally:
+            ui_client_base.UIXpraClient.init = saved
+        self.assertEqual(seen, [False], "keyboard sync was still enabled when the subsystems were initialized")
+
     def test_tray_windows_are_ignored(self):
         client = self.make_client()
         window_sub = client.get_subsystem("window")

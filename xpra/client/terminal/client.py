@@ -242,6 +242,12 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         # must not be advertised to the server - it would send us tray windows
         # we have no way of creating:
         opts.system_tray = False
+        # the keyboard must be client-managed: with sync enabled the server
+        # holds each key down between our press and release packets, and the
+        # rollover of ordinary fast typing then collapses repeated letters
+        # ("already pressed, ignoring") and mispairs the releases - letters
+        # go missing on screen while the key events are all delivered:
+        opts.keyboard_sync = False
         UIXpraClient.init(self, opts)
         # a terminal window has no decorations to put a header bar in:
         self.headerbar = "no"

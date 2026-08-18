@@ -418,7 +418,12 @@ class KeyboardHelper:
                 v = getattr(self, f"{x}_option", "")
             if not v:
                 v = getattr(self, x)
-            if v:
+            if x == "sync":
+                # always include booleans: dropping a `False` here would make
+                # the server fall back to its default (which is `True`, so
+                # disabling the keyboard sync would be impossible):
+                props[x] = bool(v)
+            elif v:
                 props[x] = v
         return props
 

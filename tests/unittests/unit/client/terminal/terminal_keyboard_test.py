@@ -86,8 +86,8 @@ class TerminalKeyboardTest(unittest.TestCase):
 
     def test_no_local_keymap(self):
         keyboard = terminal_keyboard.TerminalKeyboard()
-        # no key repeat: each repeat is delivered as a new key press,
-        # which is also what keeps `keyboard_sync` disabled:
+        # no key repeat: each repeat is delivered as a new key press
+        # (`keyboard_sync` is turned off by the client's `init`):
         self.assertIsNone(keyboard.get_keyboard_repeat())
         self.assertEqual(keyboard.get_keymap_spec(), {})
         self.assertEqual(keyboard.get_x11_keymap(), {})
@@ -107,9 +107,9 @@ class TerminalKeyboardTest(unittest.TestCase):
 @unittest.skipIf(terminal_keyboard is None, "the terminal client component is not available")
 class TerminalKeyboardHelperTest(unittest.TestCase):
 
-    def make_helper(self):
+    def make_helper(self, *args):
         packets = []
-        helper = terminal_keyboard.TerminalKeyboardHelper(lambda *packet: packets.append(packet))
+        helper = terminal_keyboard.TerminalKeyboardHelper(lambda *packet: packets.append(packet), *args)
         self.addCleanup(helper.cleanup)
         return helper, packets
 
@@ -139,6 +139,13 @@ class TerminalKeyboardHelperTest(unittest.TestCase):
         self.assertNotIn("query_struct", props)
         # what the `keyboard` subsystem skips when the keyboard data is delayed:
         self.assertEqual(helper.get_keymap_properties(("layout", )).get("layout"), None)
+
+    def test_keyboard_sync_off_is_sent_to_the_server(self):
+        # the server defaults to sync=True, so a `False` must actually be sent
+        # in the keymap properties - it must not be dropped as a falsy value:
+        helper = self.make_helper(False)[0]
+        self.assertIs(helper.sync, False)
+        self.assertIs(helper.get_keymap_properties().get("sync"), False)
 
     def test_send_key_action(self):
         helper, packets = self.make_helper()
