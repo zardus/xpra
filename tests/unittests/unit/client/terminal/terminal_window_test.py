@@ -647,6 +647,15 @@ class TerminalWindowTest(unittest.TestCase):
         window.show_all()
         self.assertNotIn(WINDOW_CONFIGURE, client.packet_types())
 
+    def test_quit_shortcut_action(self):
+        # `KeyboardHelper.key_handled_as_shortcut` invokes the shortcut action
+        # on the window: the default `#+F4:quit` binding must detach the client:
+        client, window = self.make_window()
+        quits = []
+        client.quit = lambda *args: quits.append(args)
+        window.quit()
+        self.assertEqual(quits, [(0, )])
+
     ######################################################################
     # stacking and focus
 

@@ -355,6 +355,15 @@ class ClientWindow(ClientWindowBase):
         super().destroy()
 
     ######################################################################
+    # key shortcut actions
+    # (`KeyboardHelper.key_handled_as_shortcut` invokes these on the window)
+
+    def quit(self) -> None:
+        """ detach from the server: the default `#+F4:quit` shortcut lands here """
+        log.info("quit shortcut: detaching")
+        self._client.quit(0)
+
+    ######################################################################
     # geometry
 
     def is_desktop(self) -> bool:
