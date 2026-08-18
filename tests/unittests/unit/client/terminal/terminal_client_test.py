@@ -681,6 +681,33 @@ class TerminalClientTest(unittest.TestCase):
         self.assertEqual([(a[1], a[2]) for a in kb.actions], [("Control_L", False)])
         self.assertEqual(client._mod_keys_down, {})
 
+    def test_std_streams_are_sealed(self):
+        # anything writing to fd 1 or fd 2 during terminal mode corrupts the
+        # escape stream and the terminal drops the graphics command it was
+        # parsing - both fds must point away from the tty while sealed:
+        client = self.make_client()
+        sink = tempfile.NamedTemporaryFile(delete=False)
+        self.addCleanup(os.unlink, sink.name)
+        handler = AdHocStruct()
+        handler.baseFilename = sink.name
+        client.log_handler = handler
+        saved = terminal_client.is_a_tty
+        terminal_client.is_a_tty = lambda *_: True
+        self.addCleanup(setattr, terminal_client, "is_a_tty", saved)
+        client.seal_std_streams()
+        try:
+            self.assertIsNotNone(client._sealed_fds)
+            os.write(1, b"STRAY-STDOUT\n")
+            os.write(2, b"STRAY-STDERR\n")
+        finally:
+            client.unseal_std_streams()
+        self.assertIsNone(client._sealed_fds)
+        data = open(sink.name, "rb").read()
+        self.assertIn(b"STRAY-STDOUT", data)
+        self.assertIn(b"STRAY-STDERR", data)
+        # sealing twice and unsealing twice must be safe:
+        client.unseal_std_streams()
+
     def test_typing_burst_requests_a_refresh(self):
         # one refresh request per typing burst, to repair server-side damage holes:
         client, window_sub = self.make_input_client()

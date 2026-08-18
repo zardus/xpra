@@ -73,6 +73,11 @@ TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 750)
 FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", 0)
 # how long to wait for the terminal to answer the frame edit probe, in milliseconds:
 FRAME_PROBE_TIMEOUT: Final[int] = envint("XPRA_TERMINAL_FRAME_PROBE_TIMEOUT", 1000)
+# while the terminal is in graphics mode, reroute the process file descriptors 1 and 2
+# away from the tty: any stray `stderr` write (a GLib warning, a DeprecationWarning,
+# any library printing) landing inside an escape sequence makes the terminal abort the
+# graphics command it is parsing - the update is silently dropped:
+SEAL_STDIO: Final[bool] = envbool("XPRA_TERMINAL_SEAL_STDIO", True)
 
 # the image and placement ids we use for things which are not windows:
 PROBE_IMAGE_ID: Final[int] = graphics.CURSOR_IMAGE_ID + 1
@@ -185,6 +190,8 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.frame_probe_timer: int = 0
         self.log_handler = None
         self.saved_log_handlers: list | None = None
+        # while sealed: (private tty copy for the renderer, saved fd 1, saved fd 2)
+        self._sealed_fds: tuple[int, int, int] | None = None
         # the terminal only reports key releases when the kitty keyboard protocol
         # is active, otherwise we have to synthesize them (see `handle_key_event`):
         self.kitty_keyboard: bool = False
@@ -279,13 +286,67 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
 
     def make_terminal_output(self) -> TerminalOutput:
         """ the single terminal writer - overridden by the tests to capture what we emit """
+        if self._sealed_fds is not None:
+            # the renderer owns a private copy of the tty, see `seal_std_streams`:
+            return TerminalOutput(os.fdopen(self._sealed_fds[0], "wb", buffering=0, closefd=False))
         return TerminalOutput(getattr(sys.stdout, "buffer", sys.stdout))
+
+    def seal_std_streams(self) -> None:
+        """
+        Nothing but the renderer may write to the terminal while it is in
+        graphics mode: a single stray line on fd 1 or fd 2 (a GLib warning,
+        a `DeprecationWarning`, any library printing to stderr) lands inside
+        an escape sequence and makes the terminal abort the graphics command
+        it is parsing - the update is silently dropped, letters go missing.
+        Give the renderer a private duplicate of the tty and point the process
+        file descriptors 1 and 2 at our log file (or /dev/null) instead.
+        """
+        if not SEAL_STDIO or self._sealed_fds is not None or not is_a_tty(sys.stdout):
+            return
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except OSError:
+            pass
+        tty_fd = os.dup(1)
+        saved_out = os.dup(1)
+        saved_err = os.dup(2)
+        sink_path = getattr(self.log_handler, "baseFilename", "") or os.devnull
+        try:
+            sink = os.open(sink_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        except OSError:
+            sink = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(sink, 1)
+        os.dup2(sink, 2)
+        os.close(sink)
+        self._sealed_fds = (tty_fd, saved_out, saved_err)
+        log("seal_std_streams() stray fd 1 and 2 output now goes to %r", sink_path)
+
+    def unseal_std_streams(self) -> None:
+        sealed = self._sealed_fds
+        if sealed is None:
+            return
+        self._sealed_fds = None
+        tty_fd, saved_out, saved_err = sealed
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except OSError:
+            pass
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        for fd in (tty_fd, saved_out, saved_err):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def start_terminal_mode(self) -> None:
         """ switch the terminal into graphics mode - UI thread, once, after the handshake """
         if self.terminal_output is not None:
             return
         self.redirect_logging()
+        self.seal_std_streams()
         output = self.make_terminal_output()
         self.terminal_output = output
         self.terminal_context = TerminalContext(self.terminal_fd, output)
@@ -328,6 +389,7 @@ class XpraTerminalClient(GObjectClientAdapter, UIXpraClient):
         self.terminal_context = None
         if context is not None:
             context.exit()
+        self.unseal_std_streams()
         self.restore_logging()
 
     def delete_images(self, output: TerminalOutput) -> None:
