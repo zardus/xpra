@@ -240,6 +240,7 @@ class TestSharedMemory(unittest.TestCase):
         self.assertEqual(payload, b64encode(b"/xpra-terminal-1-1"))
 
 
+@unittest.skipIf(graphics is None, "the terminal client graphics module is not available")
 class TestPlace(unittest.TestCase):
 
     def test_golden(self):
