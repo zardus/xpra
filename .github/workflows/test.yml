@@ -66,6 +66,7 @@ jobs:
         CYTHONIZE_MORE: ${{ matrix.cythonize }}
       run: >
         python3 setup.py unittests
+        --with-terminal_client
         --skip-fail unit.client.splash_test
         --skip-slow unit.client.x11_client_test
         --skip-slow unit.server.subsystem.startdesktop_option_test
