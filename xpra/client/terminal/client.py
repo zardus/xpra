@@ -64,12 +64,14 @@ SIZE_CONFIRM_DELAY: Final[int] = envint("XPRA_TERMINAL_SIZE_CONFIRM_DELAY", 500)
 # 0 (the default) disables it:
 TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 0)
 # `a=f` frame edits update damaged regions without re-sending the whole image,
-# but kitty (0.45) drops chunked frame edits which directly follow another
-# chunked graphics command: the edit is accepted without an error response and
-# never rendered.  This is deterministic: replaying a captured client stream
-# into kitty reproduces it, and inserting delays between the commands makes it
-# render correctly.  Full image retransmits are unaffected (and they no longer
-# flicker, see `BACK_IMAGE_OFFSET`), so they are the default:
+# but kitty (0.45) misfiles a chunked frame edit whose continuation chunks
+# follow the protocol ("subsequent chunks must have only the `m`, `q` and
+# `a=f` keys"): the missing `r` on a continuation makes it append a new
+# animation frame instead of editing frame 1, so the edit is accepted but
+# never shown - `patch` works around it by repeating `i` and `r` on every
+# chunk.  kitty issue: <link>
+# Full image retransmits are unaffected (and they do not flicker,
+# see `BACK_IMAGE_OFFSET`), so they remain the default:
 # -1 = detect support with a probe and use them, 0 = never, 1 = always:
 FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", 0)
 # how long to wait for the terminal to answer the frame edit probe, in milliseconds:
@@ -110,7 +112,8 @@ KEYBOARD_EVENT_TYPES: Final[int] = 2
 # `xterm` (which introduced the mode), WezTerm and Ghostty report the same 1-based
 # coordinates as the SGR cell reports the mode extends, but kitty reports them 0-based
 # (`encode_mouse_event_impl` in `kitty/mouse.c` sends the window relative pixel position
-# unmodified), so the base has to be picked per terminal.
+# unmodified - kitty is 1-based in mode 1006 and 0-based in mode 1016 for the same
+# click), so the base has to be picked per terminal.  kitty issue: <link>
 # -1, the default, means: 0 when we are running in kitty, 1 everywhere else.
 MOUSE_COORDINATE_BASE: Final[int] = envint("XPRA_TERMINAL_MOUSE_COORDINATE_BASE", -1)
 

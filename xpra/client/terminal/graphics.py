@@ -135,7 +135,12 @@ def patch(image_id: int, x: int, y: int, width: int, height: int, pixels: bytes,
         control += ",o=z"
     control += ",X=1"
     log("patch(%i, %i, %i, %i, %i, %i bytes, %s)", image_id, x, y, width, height, len(pixels), compress)
-    return chunked(control, payload, cont=FRAME_ACTION)
+    # the continuation chunks repeat `i` and `r` as well as the `a=f` the
+    # protocol requires: kitty (0.45) computes the frame number from each
+    # continuation chunk, where a missing `r` means "append a new frame" -
+    # the edit of frame 1 silently becomes an invisible animation frame
+    # unless every chunk repeats `r`:
+    return chunked(control, payload, cont=f"{FRAME_ACTION},i={image_id},r=1")
 
 
 def transmit_shm(image_id: int, width: int, height: int, name: str, alpha=True) -> bytes:

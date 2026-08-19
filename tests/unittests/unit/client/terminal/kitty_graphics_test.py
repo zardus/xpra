@@ -158,9 +158,11 @@ class TestChunking(unittest.TestCase):
         self.assertEqual(escapes[-1][0], "m=0")
         self.assertEqual(b"".join(payload for _, payload in escapes), encoded)
 
-    def test_patch_chunks_repeat_the_frame_action(self):
-        # the protocol requires every continuation chunk of an `a=f` transmission to repeat `a=f`:
-        # without it the terminal routes them through the whole image path and replaces the image
+    def test_patch_chunks_repeat_the_frame_action_and_target(self):
+        # the protocol requires every continuation chunk of an `a=f` transmission to repeat `a=f`;
+        # `i` and `r` are repeated as well: kitty computes the frame number from
+        # each continuation chunk, and a missing `r` appends a new animation
+        # frame instead of editing frame 1 (the edit is accepted, never shown)
         raw_size = graphics.MAX_CHUNK // 4 * 3 + 3
         pixels = raw_pixels(raw_size)
         escapes = split_escapes(graphics.patch(5, 0, 0, 1, raw_size // 4, pixels, compress=False))
@@ -168,7 +170,7 @@ class TestChunking(unittest.TestCase):
         self.assertTrue(escapes[0][0].startswith("a=f,"), escapes[0][0])
         self.assertTrue(escapes[0][0].endswith(",m=1"), escapes[0][0])
         self.assertEqual(len(escapes[0][1]), graphics.MAX_CHUNK)
-        self.assertEqual(escapes[1][0], "a=f,m=0")
+        self.assertEqual(escapes[1][0], "a=f,i=5,r=1,m=0")
         self.assertEqual(b"".join(payload for _, payload in escapes), b64encode(pixels))
 
     def test_patch_many_chunks(self):
@@ -182,10 +184,10 @@ class TestChunking(unittest.TestCase):
         self.assertEqual(escapes[0][0],
                          "a=f,q=2,i=5,r=1,x=2,y=4,s=1,v=%i,X=1,m=1" % (raw_size // 4))
         for control, payload in escapes[1:-1]:
-            self.assertEqual(control, "a=f,m=1")
+            self.assertEqual(control, "a=f,i=5,r=1,m=1")
             self.assertEqual(len(payload), graphics.MAX_CHUNK)
             self.assertEqual(len(payload) % 4, 0)
-        self.assertEqual(escapes[-1][0], "a=f,m=0")
+        self.assertEqual(escapes[-1][0], "a=f,i=5,r=1,m=0")
         self.assertLessEqual(len(escapes[-1][1]), graphics.MAX_CHUNK)
         self.assertEqual(b"".join(payload for _, payload in escapes), encoded)
 
@@ -197,7 +199,7 @@ class TestChunking(unittest.TestCase):
         self.assertEqual(data,
                          APC + b"a=f,q=2,i=5,r=1,x=0,y=0,s=1,v=%i,X=1,m=1;" % (len(pixels) // 4) +
                          encoded[:graphics.MAX_CHUNK] + ST +
-                         APC + b"a=f,m=0;" + encoded[graphics.MAX_CHUNK:] + ST)
+                         APC + b"a=f,i=5,r=1,m=0;" + encoded[graphics.MAX_CHUNK:] + ST)
 
     def test_transmit_chunks_carry_no_action(self):
         # `a=t` is the opposite case: continuation chunks must carry only `m=`
