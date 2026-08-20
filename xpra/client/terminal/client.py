@@ -69,8 +69,7 @@ TYPE_REFRESH_DELAY: Final[int] = envint("XPRA_TERMINAL_TYPE_REFRESH_DELAY", 0)
 # `a=f` keys"): the missing `r` on a continuation makes it append a new
 # animation frame instead of editing frame 1, so the edit is accepted but
 # never shown - `patch` works around it by repeating `i` and `r` on every
-# chunk.  kitty issue: <link>
-# Full image retransmits are unaffected (and they do not flicker,
+# chunk.  Full image retransmits are unaffected (and they do not flicker,
 # see `BACK_IMAGE_OFFSET`), so they remain the default:
 # -1 = detect support with a probe and use them, 0 = never, 1 = always:
 FRAME_EDITS: Final[int] = envint("XPRA_TERMINAL_FRAME_EDITS", 0)
@@ -113,7 +112,7 @@ KEYBOARD_EVENT_TYPES: Final[int] = 2
 # coordinates as the SGR cell reports the mode extends, but kitty reports them 0-based
 # (`encode_mouse_event_impl` in `kitty/mouse.c` sends the window relative pixel position
 # unmodified - kitty is 1-based in mode 1006 and 0-based in mode 1016 for the same
-# click), so the base has to be picked per terminal.  kitty issue: <link>
+# click), so the base has to be picked per terminal.
 # -1, the default, means: 0 when we are running in kitty, 1 everywhere else.
 MOUSE_COORDINATE_BASE: Final[int] = envint("XPRA_TERMINAL_MOUSE_COORDINATE_BASE", -1)
 
